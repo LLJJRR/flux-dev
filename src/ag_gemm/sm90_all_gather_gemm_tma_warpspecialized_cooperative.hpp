@@ -75,6 +75,7 @@
 #include "ag_gemm/sm90_all_gather_gemm_tile_scheduler.hpp"
 #include "ag_gemm/sm90_all_gather_gemm_universal_decl.h"
 #include "flux/cuda/cuda_stub.h"
+#include "flux/ag_gemm_split.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -83,8 +84,6 @@ namespace cutlass::gemm::kernel {
 using Barrier = GenericBarrier<cutlass::detail::SyncthreadsSync>;
 using SystemBarrier = cutlass::detail::SystemBarrier;
 using WarpBarrier = GenericBarrier<cutlass::detail::SyncwarpSync>;
-
-#define SPLIT 1
 
 template <
     class ProblemShape_,
@@ -267,11 +266,19 @@ public:
       problem_shape_MNKL, TileShape{}, ClusterShape{}, hw_info, args.scheduler, scheduler_workspace, NumEpilogueSubTiles);
     auto problem_blocks =
         TileScheduler::get_tiled_cta_shape_mnl(problem_shape_MNKL, TileShape{}, ClusterShape{});
+    (void)problem_blocks;
+
     CUTLASS_ASSERT(args.world_size != 0);
+    CUTLASS_ASSERT(args.ptr_barrier != nullptr);
 
     int TILE_SIZE_M = size<0>(TileShape{});
-    int n_data_chunks = args.world_size * SPLIT;
-    int m_per_data_chunk = get<0>(problem_shape_MNKL) / n_data_chunks;
+    int n_data_chunks = args.world_size * ::bytedance::flux::kAGGemmSplit;
+    int full_m = get<0>(problem_shape_MNKL);
+
+    CUTLASS_ASSERT(n_data_chunks != 0);
+    CUTLASS_ASSERT(full_m % n_data_chunks == 0);
+
+    int m_per_data_chunk = full_m / n_data_chunks;
 
     return {
         args.mode,
@@ -578,11 +585,8 @@ public:
                                       ? new_data_chunk_id_end
                                       : (params.n_data_chunks - 1);
 
-          if (new_data_chunk_id_start != data_chunk_id_start ||
-              new_data_chunk_id_end != data_chunk_id_end) {
-            for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
-              WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
-            }
+          for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+            WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
           }
 
           // Get the number of K tiles to compute for this work as well as the starting K tile offset of the work.

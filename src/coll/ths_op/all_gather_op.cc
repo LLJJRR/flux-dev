@@ -24,6 +24,7 @@
 #include "flux/cuda/cuda_common.h"
 #include "flux/cuda/cuda_stub.h"
 #include "flux/utils.h"
+#include "flux/ag_gemm_split.h"
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
 #include <c10/core/DeviceType.h>
@@ -32,14 +33,54 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/util/Optional.h>
 
-#define SPLIT 1
 
 namespace bytedance::flux::ths_op {
 
 using ths_op::is_s8_torch_dtype;
 
 namespace {
-constexpr int kNumSignals = 64;  // TODO(houqi.1993) set this global
+
+constexpr int SPLIT = ::bytedance::flux::kAGGemmSplit;
+constexpr int kNumSignals = ::bytedance::flux::kAGGemmNumSignals;
+
+struct SplitRange {
+  size_t offset;
+  size_t bytes;
+};
+
+inline SplitRange
+get_row_split_range(int64_t rows, size_t row_bytes, int split_idx) {
+  int64_t row_begin = rows * split_idx / SPLIT;
+  int64_t row_end = rows * (split_idx + 1) / SPLIT;
+
+  return SplitRange{
+      static_cast<size_t>(row_begin) * row_bytes,
+      static_cast<size_t>(row_end - row_begin) * row_bytes};
+}
+
+inline SplitRange
+get_input_split_range(const torch::Tensor &input, int split_idx) {
+  FLUX_CHECK(input.dim() == 2);
+  FLUX_CHECK(input.is_contiguous()) << "SPLIT AG requires contiguous input";
+
+  size_t row_bytes = static_cast<size_t>(input.size(1)) * input.element_size();
+  return get_row_split_range(input.size(0), row_bytes, split_idx);
+}
+
+inline SplitRange
+get_scale_split_range(
+    const torch::Tensor &input,
+    const torch::Tensor &input_scale,
+    int split_idx) {
+  FLUX_CHECK(input_scale.is_contiguous()) << "SPLIT AG requires contiguous input_scale";
+  FLUX_CHECK(input_scale.size(0) == input.size(0));
+
+  size_t scale_row_bytes =
+      static_cast<size_t>(input_scale.nbytes() / input_scale.size(0));
+
+  return get_row_split_range(input.size(0), scale_row_bytes, split_idx);
+}
+
 }  // namespace
 
 class AllGatherOp::AllGatherOpImpl {
@@ -359,6 +400,34 @@ AllGatherOp::AllGatherOpImpl::run(
     FLUX_CHECK(!input_scale.has_value())
         << "input_scale is provided but not supported for this AllGatherOp";
   }
+
+  // First SPLIT implementation only supports the simple cudaMemcpyAsync AG path.
+  // CUDA-core local copy / CUDA-core AG kernel need separate split-aware changes.
+  if constexpr (SPLIT > 1) {
+    FLUX_CHECK(!opt.use_cuda_core_local)
+        << "SPLIT > 1 first supports cudaMemcpyAsync local path only";
+
+    FLUX_CHECK(!opt.use_cuda_core_ag)
+        << "SPLIT > 1 first supports cudaMemcpyAsync AG path only";
+
+    FLUX_CHECK(input.dim() == 2)
+        << "SPLIT > 1 requires 2D input";
+
+    FLUX_CHECK(input.is_contiguous())
+        << "SPLIT > 1 requires contiguous input";
+
+    FLUX_CHECK(input.size(0) % SPLIT == 0)
+        << "First SPLIT implementation requires local M divisible by SPLIT, "
+        << "local_m=" << input.size(0) << ", SPLIT=" << SPLIT;
+
+    if (input_scale.has_value()) {
+      FLUX_CHECK(input_scale->is_contiguous())
+          << "SPLIT > 1 requires contiguous input_scale";
+
+      FLUX_CHECK(input_scale->size(0) == input.size(0))
+          << "input_scale M dimension must match input M dimension";
+    }
+  }
   if (opt.use_cuda_core_local) {
     // local_copy flag check within below function
     copy_local_and_sync_with_kernel(
@@ -415,40 +484,47 @@ AllGatherOp::AllGatherOpImpl::copy_local_and_sync_with_cudaMemcpyAsync(
   void *input_buffer_ptr = this->input_buffer_.data_ptr();
 
   barrier_async(stream);
-  if (!is_input_buffer_copied) {
-    CUDA_CHECK(cudaMemcpyAsync(
-        ptr_offset(input_buffer_ptr, this->rank * chunk_size),
-        input_ptr,
-        chunk_size,
-        cudaMemcpyDefault,
-        stream));
-
-    // only input scale of s8 gemm requires all gather.
-    // TODO(houqi.1993) only S8 has input scale?
-    if (input_scale.has_value()) {
-      void *input_scale_ptr = input_scale->data_ptr();
-      void *input_scale_buffer_ptr = this->input_scale_buffer_.data_ptr();
-      size_t scale_size = input_scale->numel() * input_scale->element_size();
-
-      CUDA_CHECK(cudaMemcpyAsync(
-          ptr_offset(input_scale_buffer_ptr, this->rank * scale_size),
-          input_scale_ptr,
-          scale_size,
-          cudaMemcpyDefault,
-          stream));
-    }
-  }
 
   // reset counter && ag signal
   if (use_cuda_core_ag) {
     CUDA_CHECK(cudaMemsetAsync(
         this->counter_buffer.data_ptr(), 0, this->counter_buffer.nbytes(), stream));
   }
+
+  // reset barrier before setting split-ready flags
   CUDA_CHECK(
       cudaMemsetAsync(this->barrier_buffer.data_ptr(), 0, this->barrier_buffer.nbytes(), stream));
+
   for (int j = 0; j < SPLIT; ++j) {
+    auto r = get_input_split_range(input, j);
+
+    if (!is_input_buffer_copied) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          ptr_offset(input_buffer_ptr, this->rank * chunk_size + r.offset),
+          ptr_offset(input_ptr, r.offset),
+          r.bytes,
+          cudaMemcpyDefault,
+          stream));
+
+      if (input_scale.has_value()) {
+        void *input_scale_ptr = input_scale->data_ptr();
+        void *input_scale_buffer_ptr = this->input_scale_buffer_.data_ptr();
+        size_t scale_chunk_size = input_scale->nbytes();
+
+        auto sr = get_scale_split_range(input, input_scale.value(), j);
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            ptr_offset(input_scale_buffer_ptr, this->rank * scale_chunk_size + sr.offset),
+            ptr_offset(input_scale_ptr, sr.offset),
+            sr.bytes,
+            cudaMemcpyDefault,
+            stream));
+      }
+    }
+
     set_ready(this->rank, this->rank, j, stream);
   }
+
   barrier_async(stream);
 }
 
@@ -533,40 +609,40 @@ AllGatherOp::AllGatherOpImpl::copy_all_to_all(
     bool use_cuda_core,
     cudaStream_t stream) {
   size_t chunk_size = input.nbytes();
-  size_t split_chunk_size = chunk_size / SPLIT;
   bool has_input_scale = this->with_input_scale && input_scale.has_value();
+
   if (use_cuda_core) {
-    // use d2d copy kernel for s8 gemm
-    c10::ScalarType torch_scale_dtype =
-        has_input_scale ? input_scale->scalar_type() : c10::ScalarType::Float;
-    this->copy_param.m = input.size(0);
-    this->copy_param.n = input.size(1);
-    ag_a2a_mode(
-        this->copy_param,
-        ths_op::from_torch_dtype(this->input_dtype),
-        ths_op::from_torch_dtype(torch_scale_dtype),
-        stream);
+    FLUX_CHECK(SPLIT == 1)
+        << "SPLIT>1 cuda-core All2All path is not implemented yet";
+
+    copy_ring_push_by_kernel(input, input_scale, false, stream);
+    return;
   } else {
     for (int i = rank + 1; i < (world_size + rank); ++i) {
       auto id = i % this->world_size;
+
       for (int j = 0; j < SPLIT; ++j) {
-        auto split_offset = j * split_chunk_size;
+        auto r = get_input_split_range(input, j);
+
         CUDA_CHECK(cudaMemcpyAsync(
-            ptr_offset(this->input_ptrs[rank], id * chunk_size + split_offset),
-            ptr_offset(this->input_ptrs[id], id * chunk_size + split_offset),
-            split_chunk_size,
+            ptr_offset(this->input_ptrs[rank], id * chunk_size + r.offset),
+            ptr_offset(this->input_ptrs[id], id * chunk_size + r.offset),
+            r.bytes,
             cudaMemcpyDefault,
             stream));
+
         if (has_input_scale) {
-          size_t chunk_size = input_scale->nbytes();
-          size_t split_chunk_size = chunk_size / SPLIT;
+          size_t scale_chunk_size = input_scale->nbytes();
+          auto sr = get_scale_split_range(input, input_scale.value(), j);
+
           CUDA_CHECK(cudaMemcpyAsync(
-              ptr_offset(this->input_scale_ptrs[this->rank], id * chunk_size + split_offset),
-              ptr_offset(this->input_scale_ptrs[id], id * chunk_size + split_offset),
-              split_chunk_size,
+              ptr_offset(this->input_scale_ptrs[this->rank], id * scale_chunk_size + sr.offset),
+              ptr_offset(this->input_scale_ptrs[id], id * scale_chunk_size + sr.offset),
+              sr.bytes,
               cudaMemcpyDefault,
               stream));
         }
+
         set_ready(this->rank, id, j, stream);
       }
     }
@@ -578,33 +654,40 @@ AllGatherOp::AllGatherOpImpl::copy_ring_pull(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
   // barrier_ptrs[rank, segment, split] means rank data is ready
   size_t chunk_size = input.nbytes();
-  size_t split_chunk_size = chunk_size / SPLIT;
-  // always the  0 <- 1 <- 2 <- 3 <- 0 order
-  int from_rank = (this->rank + 1) % this->world_size;  // always copy to rank next
+
+  // always the 0 <- 1 <- 2 <- 3 <- 0 order
+  int from_rank = (this->rank + 1) % this->world_size;
+
   for (int i = 0; i < this->world_size - 1; i++) {
-    int recv_segment = (this->rank + i + 1) % this->world_size;  // copy from self
+    int recv_segment = (this->rank + i + 1) % this->world_size;
+
     for (int j = 0; j < SPLIT; ++j) {
-      auto split_offset = j * split_chunk_size;
+      auto r = get_input_split_range(input, j);
+
       if (i != 0) {
         // previous rank recv done
         wait_ready(from_rank, recv_segment, j, stream);
       }
+
       CUDA_CHECK(cudaMemcpyAsync(
-          ptr_offset(this->input_ptrs[this->rank], recv_segment * chunk_size + split_offset),
-          ptr_offset(this->input_ptrs[from_rank], recv_segment * chunk_size + split_offset),
-          split_chunk_size,
+          ptr_offset(this->input_ptrs[this->rank], recv_segment * chunk_size + r.offset),
+          ptr_offset(this->input_ptrs[from_rank], recv_segment * chunk_size + r.offset),
+          r.bytes,
           cudaMemcpyDeviceToDevice,
           stream));
 
       if (input_scale.has_value()) {
-        size_t chunk_size = input_scale->nbytes();
-        size_t split_chunk_size = chunk_size / SPLIT;
+        size_t scale_chunk_size = input_scale->nbytes();
+        auto sr = get_scale_split_range(input, input_scale.value(), j);
+
         CUDA_CHECK(cudaMemcpyAsync(
             ptr_offset(
-                this->input_scale_ptrs[this->rank], recv_segment * chunk_size + split_offset),
+                this->input_scale_ptrs[this->rank],
+                recv_segment * scale_chunk_size + sr.offset),
             ptr_offset(
-                this->input_scale_ptrs[from_rank], recv_segment * chunk_size + split_offset),
-            split_chunk_size,
+                this->input_scale_ptrs[from_rank],
+                recv_segment * scale_chunk_size + sr.offset),
+            sr.bytes,
             cudaMemcpyDeviceToDevice,
             stream));
       }
@@ -618,35 +701,44 @@ void
 AllGatherOp::AllGatherOpImpl::copy_ring_push_1d(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
   size_t chunk_size = input.nbytes();
-  size_t split_chunk_size = chunk_size / SPLIT;
-  // always the  0 <- 1 <- 2 <- 3 <- 0 order
-  int to_rank =
-      (this->rank - 1 + this->world_size) % this->world_size;  // always recv data from rank prev
+
+  // always the 0 <- 1 <- 2 <- 3 <- 0 order
+  int to_rank = (this->rank - 1 + this->world_size) % this->world_size;
+
   for (int i = 0; i < this->world_size - 1; i++) {
     int send_segment = (this->rank + i) % this->world_size;
+
     for (int j = 0; j < SPLIT; ++j) {
-      auto split_offset = j * split_chunk_size;
-      if (i != 0) {  // previous rank recv done. i == 0 it is always ready
+      auto r = get_input_split_range(input, j);
+
+      if (i != 0) {
+        // current rank must already have this segment before pushing it
         wait_ready(this->rank, send_segment, j, stream);
       }
+
       CUDA_CHECK(cudaMemcpyAsync(
-          ptr_offset(this->input_ptrs[to_rank], send_segment * chunk_size + split_offset),
-          ptr_offset(this->input_ptrs[this->rank], send_segment * chunk_size + split_offset),
-          split_chunk_size,
+          ptr_offset(this->input_ptrs[to_rank], send_segment * chunk_size + r.offset),
+          ptr_offset(this->input_ptrs[this->rank], send_segment * chunk_size + r.offset),
+          r.bytes,
           cudaMemcpyDeviceToDevice,
           stream));
 
       if (input_scale.has_value()) {
-        size_t chunk_size = input_scale->nbytes();
-        size_t split_chunk_size = chunk_size / SPLIT;
+        size_t scale_chunk_size = input_scale->nbytes();
+        auto sr = get_scale_split_range(input, input_scale.value(), j);
+
         CUDA_CHECK(cudaMemcpyAsync(
-            ptr_offset(this->input_scale_ptrs[to_rank], send_segment * chunk_size + split_offset),
             ptr_offset(
-                this->input_scale_ptrs[this->rank], send_segment * chunk_size + split_offset),
-            split_chunk_size,
+                this->input_scale_ptrs[to_rank],
+                send_segment * scale_chunk_size + sr.offset),
+            ptr_offset(
+                this->input_scale_ptrs[this->rank],
+                send_segment * scale_chunk_size + sr.offset),
+            sr.bytes,
             cudaMemcpyDeviceToDevice,
             stream));
       }
+
       set_ready(to_rank, send_segment, j, stream);
     }
   }
@@ -656,44 +748,58 @@ void
 AllGatherOp::AllGatherOpImpl::copy_ring_push_2d_pcie(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
   size_t chunk_size = input.nbytes();
-  size_t split_chunk_size = chunk_size / SPLIT;
+
   // [0, numa_world_size) stages:  0 <- 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 0
-  // [numa_world_size, world_size) stages: 0 <- 1 <- 2 <-3 <- 0 && 4 <- 5 <- 6 <- 7 <- 4
-  int to_rank = (rank - 1 + world_size) % world_size;  // always recv data from rank prev
+  // [numa_world_size, world_size) stages:
+  //   0 <- 1 <- 2 <- 3 <- 0
+  //   4 <- 5 <- 6 <- 7 <- 4
+  int to_rank = (rank - 1 + world_size) % world_size;
+
   int numa_world_size = topo_utils::topo_numa_local_world_size();
   FLUX_CHECK_DIV(this->local_world_size, numa_world_size);
+
   int numa_nodes = this->local_world_size / numa_world_size;
   FLUX_CHECK_EQ(numa_nodes, 2) << " world_size " << this->local_world_size
                                << " with numa_world_size " << numa_world_size;
+
   int nnode = rank / numa_world_size;
-  for (int i = 0; i < world_size - 1; i++) {  // with inner and intra numa node
+
+  for (int i = 0; i < world_size - 1; i++) {
     int send_segment = (rank + i) % world_size;
     bool is_2d_step = i >= numa_world_size && rank % numa_world_size == 0;
+
     if (is_2d_step) {
       send_segment = (send_segment + numa_world_size) % world_size;
       to_rank = (rank - 1 + numa_world_size) % numa_world_size + nnode * numa_world_size;
     }
+
     for (int j = 0; j < SPLIT; ++j) {
-      auto split_offset = j * split_chunk_size;
-      if (i != 0 && !is_2d_step) {  // for i == 0 it is always ready
-        // previous rank recv done
+      auto r = get_input_split_range(input, j);
+
+      if (i != 0 && !is_2d_step) {
+        // current rank must already have this segment before pushing it
         wait_ready(rank, send_segment, j, stream);
       }
+
       CUDA_CHECK(cudaMemcpyAsync(
-          ptr_offset(this->input_ptrs[to_rank], send_segment * chunk_size + split_offset),
-          ptr_offset(this->input_ptrs[rank], send_segment * chunk_size + split_offset),
-          split_chunk_size,
+          ptr_offset(this->input_ptrs[to_rank], send_segment * chunk_size + r.offset),
+          ptr_offset(this->input_ptrs[rank], send_segment * chunk_size + r.offset),
+          r.bytes,
           cudaMemcpyDeviceToDevice,
           stream));
 
       if (input_scale.has_value()) {
-        size_t chunk_size = input_scale->nbytes();
-        size_t split_chunk_size = chunk_size / SPLIT;
+        size_t scale_chunk_size = input_scale->nbytes();
+        auto sr = get_scale_split_range(input, input_scale.value(), j);
+
         CUDA_CHECK(cudaMemcpyAsync(
-            ptr_offset(this->input_scale_ptrs[to_rank], send_segment * chunk_size + split_offset),
             ptr_offset(
-                this->input_scale_ptrs[this->rank], send_segment * chunk_size + split_offset),
-            split_chunk_size,
+                this->input_scale_ptrs[to_rank],
+                send_segment * scale_chunk_size + sr.offset),
+            ptr_offset(
+                this->input_scale_ptrs[this->rank],
+                send_segment * scale_chunk_size + sr.offset),
+            sr.bytes,
             cudaMemcpyDeviceToDevice,
             stream));
       }

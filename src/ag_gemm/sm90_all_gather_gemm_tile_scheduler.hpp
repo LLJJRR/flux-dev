@@ -36,6 +36,7 @@
 #include "flux/cuda/memory_utils.hpp"
 
 #include "ag_gemm/all_gather_swizzle.hpp"
+#include "flux/ag_gemm_split.h"
 
 namespace cutlass::gemm::kernel::detail {
 using SystemBarrier = cutlass::detail::SystemBarrier;
@@ -75,6 +76,12 @@ class Sm90AGKernelTileScheduler {
 
     int nnodes = 1;
     int node_id = 0;
+
+    int rank = 0;
+    int world_size = 1;
+    int split = bytedance::flux::kAGGemmSplit;
+    int n_data_chunks = 1;
+    int problem_blocks_per_chunk = 1;
   };
 
   // Sink scheduler params as a member
@@ -120,6 +127,22 @@ class Sm90AGKernelTileScheduler {
     int M_per_rank = static_cast<int>(get<0>(problem_shape_mnkl)) / world_size;
     int M_start = M_per_rank * rank;
     int problem_blocks_m_offset = (M_start + get<0>(tile_shape) - 1) / get<0>(tile_shape);
+    int split = bytedance::flux::kAGGemmSplit;
+
+    int n_data_chunks = world_size * split;
+
+    int full_m = static_cast<int>(get<0>(problem_shape_mnkl));
+    int tile_m = static_cast<int>(get<0>(tile_shape));
+
+    FLUX_CHECK(full_m % n_data_chunks == 0)
+        << "split-aware scheduler requires full_m divisible by world_size * SPLIT";
+
+    int m_per_data_chunk = full_m / n_data_chunks;
+
+    FLUX_CHECK(m_per_data_chunk % tile_m == 0)
+        << "first split-aware scheduler requires m_per_data_chunk divisible by tile_m";
+
+    int problem_blocks_per_chunk = m_per_data_chunk / tile_m;
 
     return {
         base_params,
@@ -127,7 +150,12 @@ class Sm90AGKernelTileScheduler {
         problem_blocks_m_offset,
         problem_blocks_m,
         nnodes,
-        node_id};
+        node_id,
+        rank,
+        world_size,
+        split,
+        n_data_chunks,
+        problem_blocks_per_chunk};
   }
 
   CUTLASS_HOST_DEVICE
@@ -176,8 +204,20 @@ class Sm90AGKernelTileScheduler {
                      local_block_m) %
             scheduler_params.problem_blocks_m;
       } else {
-        new_M_idx =
-            (M_idx + scheduler_params.problem_blocks_m_offset) % scheduler_params.problem_blocks_m;
+        if constexpr (bytedance::flux::kAGGemmSplit > 1) {
+          int tiles_per_chunk = scheduler_params.problem_blocks_per_chunk;
+          int raw_chunk = M_idx / tiles_per_chunk;
+          int tile_in_chunk = M_idx % tiles_per_chunk;
+
+          int start_chunk = scheduler_params.rank * scheduler_params.split;
+          int new_chunk = (raw_chunk + start_chunk) % scheduler_params.n_data_chunks;
+
+          new_M_idx = new_chunk * tiles_per_chunk + tile_in_chunk;
+        } else {
+          new_M_idx =
+              (M_idx + scheduler_params.problem_blocks_m_offset) %
+              scheduler_params.problem_blocks_m;
+        }
       }
       work_tile_info.M_idx = new_M_idx;
     }
