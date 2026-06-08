@@ -204,20 +204,11 @@ class Sm90AGKernelTileScheduler {
                      local_block_m) %
             scheduler_params.problem_blocks_m;
       } else {
-        if constexpr (bytedance::flux::kAGGemmSplit > 1) {
-          int tiles_per_chunk = scheduler_params.problem_blocks_per_chunk;
-          int raw_chunk = M_idx / tiles_per_chunk;
-          int tile_in_chunk = M_idx % tiles_per_chunk;
 
-          int start_chunk = scheduler_params.rank * scheduler_params.split;
-          int new_chunk = (raw_chunk + start_chunk) % scheduler_params.n_data_chunks;
-
-          new_M_idx = new_chunk * tiles_per_chunk + tile_in_chunk;
-        } else {
-          new_M_idx =
-              (M_idx + scheduler_params.problem_blocks_m_offset) %
-              scheduler_params.problem_blocks_m;
-        }
+        new_M_idx =
+            (M_idx + scheduler_params.problem_blocks_m_offset) %
+            scheduler_params.problem_blocks_m;
+        
       }
       work_tile_info.M_idx = new_M_idx;
     }

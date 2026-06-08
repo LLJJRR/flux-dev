@@ -595,10 +595,13 @@ public:
                                       ? new_data_chunk_id_end
                                       : (params.n_data_chunks - 1);
 
-          for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
-            WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
+          if (new_data_chunk_id_start != data_chunk_id_start ||
+              new_data_chunk_id_end != data_chunk_id_end) {
+            for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+              WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
+            }
           }
-
+          
           collective_mainloop.load(
             params.mainloop,
             mainloop_pipeline,
