@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 //===----------------------------------------------------------------------===//
-
+#include <iostream>
 #include "coll/all_gather_impls.hpp"
 #include "coll/local_copy_and_reset.hpp"
 #include "coll/ths_op/all_gather_op.h"
@@ -479,6 +479,16 @@ AllGatherOp::AllGatherOpImpl::copy_local_and_sync_with_cudaMemcpyAsync(
     bool is_input_buffer_copied,
     bool use_cuda_core_ag,
     cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_local_and_sync_with_cudaMemcpyAsync"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " is_input_buffer_copied=" << is_input_buffer_copied
+          << " use_cuda_core_ag=" << use_cuda_core_ag
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
+
   size_t chunk_size = input.nbytes();
   void *input_ptr = input.data_ptr();
   void *input_buffer_ptr = this->input_buffer_.data_ptr();
@@ -585,6 +595,14 @@ AllGatherOp::AllGatherOpImpl::copy_local_and_sync_with_kernel(
 void
 AllGatherOp::AllGatherOpImpl::set_ready(
     int rank_, int segment, int split_index, cudaStream_t stream) {
+
+    std::cout << "[AG DEBUG] set_ready"
+            << " self_rank=" << this->rank
+            << " dst_rank=" << rank_
+            << " segment=" << segment
+            << " split=" << split_index
+            << " signal_id=" << signal_id
+            << std::endl;
   CU_CHECK(CUStreamWriteValue(
       stream,
       (CUdeviceptr)(barrier_ptrs[rank_] + (segment * SPLIT + split_index)),
@@ -595,6 +613,15 @@ AllGatherOp::AllGatherOpImpl::set_ready(
 void
 AllGatherOp::AllGatherOpImpl::wait_ready(
     int rank_, int segment, int split_index, cudaStream_t stream) {
+
+  std::cerr << "[AG DEBUG] wait_ready"
+          << " self_rank=" << this->rank
+          << " wait_rank=" << rank_
+          << " segment=" << segment
+          << " split=" << split_index
+          << " signal_id=" << signal_id
+          << std::endl;
+
   CU_CHECK(CUStreamWaitValue(
       stream,
       (CUdeviceptr)(barrier_ptrs[rank_] + (segment * SPLIT + split_index)),
@@ -608,6 +635,14 @@ AllGatherOp::AllGatherOpImpl::copy_all_to_all(
     c10::optional<torch::Tensor> input_scale,
     bool use_cuda_core,
     cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_all_to_all"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " use_cuda_core=" << use_cuda_core
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
   size_t chunk_size = input.nbytes();
   bool has_input_scale = this->with_input_scale && input_scale.has_value();
 
@@ -652,6 +687,14 @@ AllGatherOp::AllGatherOpImpl::copy_all_to_all(
 void
 AllGatherOp::AllGatherOpImpl::copy_ring_pull(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_ring_pull"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
+
   // barrier_ptrs[rank, segment, split] means rank data is ready
   size_t chunk_size = input.nbytes();
 
@@ -700,6 +743,14 @@ AllGatherOp::AllGatherOpImpl::copy_ring_pull(
 void
 AllGatherOp::AllGatherOpImpl::copy_ring_push_1d(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_ring_push_1d"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
+
   size_t chunk_size = input.nbytes();
 
   // always the 0 <- 1 <- 2 <- 3 <- 0 order
@@ -747,6 +798,14 @@ AllGatherOp::AllGatherOpImpl::copy_ring_push_1d(
 void
 AllGatherOp::AllGatherOpImpl::copy_ring_push_2d_pcie(
     torch::Tensor input, c10::optional<torch::Tensor> input_scale, cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_ring_push_2d_pcie"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
+
   size_t chunk_size = input.nbytes();
 
   // [0, numa_world_size) stages:  0 <- 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 0
