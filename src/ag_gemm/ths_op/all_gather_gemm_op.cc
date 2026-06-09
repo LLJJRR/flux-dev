@@ -49,6 +49,8 @@
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 
+#include <iostream>
+
 namespace bytedance {
 namespace flux {
 namespace ths_op {
@@ -59,6 +61,53 @@ inline void *
 ptr_offset(void *ptr, ptrdiff_t offset) {
   return static_cast<char *>(ptr) + offset;
 }
+
+inline bool
+agk_event_profile_enabled() {
+  return std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
+}
+
+struct AGKernelEventTimer {
+  const char *name;
+  int rank;
+  cudaStream_t stream;
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  bool enabled;
+
+  AGKernelEventTimer(const char *name_, int rank_, cudaStream_t stream_)
+      : name(name_),
+        rank(rank_),
+        stream(stream_),
+        enabled(agk_event_profile_enabled()) {
+    if (enabled) {
+      CUDA_CHECK(cudaEventCreate(&start));
+      CUDA_CHECK(cudaEventCreate(&stop));
+      CUDA_CHECK(cudaEventRecord(start, stream));
+    }
+  }
+
+  ~AGKernelEventTimer() {
+    if (!enabled) {
+      return;
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    std::cout << "[AGK EVENT] rank=" << rank
+              << " name=" << name
+              << " ms=" << ms
+              << std::endl;
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+  }
+};
+
 }  // namespace
 
 /// All Gather GEMM Kernel OP
@@ -174,6 +223,12 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> output_scale,
       bool fast_accum,
       bool transpose_weight) {
+
+      cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  AGKernelEventTimer timer(
+      "AGK_gemm_only_total",
+      this->tp_group->get_rank(),
+      stream);
     torch::Tensor barrier = torch::ones(
         {this->world_size},
         at::TensorOptions(at::ScalarType::Int)
@@ -256,6 +311,12 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> gathered_input,
       c10::optional<UnifiedGemmHParams> const &hparams,
       cudaStream_t stream) {
+
+      int rank = this->tp_group->get_rank();
+  AGKernelEventTimer total_timer(
+      "AGK_forward_default_total",
+      rank,
+      stream);
     torch::Tensor barrier = ag_op.local_barrier_buffer();
     int M = input.size(0) * this->world_size;
     torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
@@ -271,24 +332,46 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     CUDA_CHECK(cudaEventRecord(this->ready_event, stream));
     CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream, this->ready_event));
 
-    ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+    {
+      AGKernelEventTimer ag_timer(
+          "AGK_ag_op_run_cp_stream_total",
+          rank,
+          this->cp_stream);
 
-    CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+      ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+    }
 
-    auto result = this->gemm_op.forward(
-        input_buffer,
-        std::move(weight),
-        std::move(bias),
-        std::move(output),
-        input_scale_tensor,
-        std::move(weight_scale),
-        std::move(output_scale),
-        barrier,
-        fast_accum,
-        transpose_weight,
-        hparams,
-        opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
-        stream);
+    {
+      AGKernelEventTimer wait_local_prepare_timer(
+          "AGK_wait_local_prepare_event",
+          rank,
+          stream);
+
+      CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+    }
+
+    torch::Tensor result;
+    {
+      AGKernelEventTimer gemm_timer(
+          "AGK_gemm_op_forward_total",
+          rank,
+          stream);
+
+      result = this->gemm_op.forward(
+          input_buffer,
+          std::move(weight),
+          std::move(bias),
+          std::move(output),
+          input_scale_tensor,
+          std::move(weight_scale),
+          std::move(output_scale),
+          barrier,
+          fast_accum,
+          transpose_weight,
+          hparams,
+          opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
+          stream);
+    }
     if (gathered_input.has_value()) {
       CHECK_INPUT(gathered_input.value(), input.scalar_type());
       CHECK_2D(gathered_input.value(), input.size(0) * this->world_size, input.size(1));
