@@ -596,13 +596,6 @@ void
 AllGatherOp::AllGatherOpImpl::set_ready(
     int rank_, int segment, int split_index, cudaStream_t stream) {
 
-    std::cout << "[AG DEBUG] set_ready"
-            << " self_rank=" << this->rank
-            << " dst_rank=" << rank_
-            << " segment=" << segment
-            << " split=" << split_index
-            << " signal_id=" << signal_id
-            << std::endl;
   CU_CHECK(CUStreamWriteValue(
       stream,
       (CUdeviceptr)(barrier_ptrs[rank_] + (segment * SPLIT + split_index)),
@@ -613,14 +606,6 @@ AllGatherOp::AllGatherOpImpl::set_ready(
 void
 AllGatherOp::AllGatherOpImpl::wait_ready(
     int rank_, int segment, int split_index, cudaStream_t stream) {
-
-  std::cerr << "[AG DEBUG] wait_ready"
-          << " self_rank=" << this->rank
-          << " wait_rank=" << rank_
-          << " segment=" << segment
-          << " split=" << split_index
-          << " signal_id=" << signal_id
-          << std::endl;
 
   CU_CHECK(CUStreamWaitValue(
       stream,
@@ -643,6 +628,7 @@ AllGatherOp::AllGatherOpImpl::copy_all_to_all(
           << " use_cuda_core=" << use_cuda_core
           << " input_nbytes=" << input.nbytes()
           << std::endl;
+          
   size_t chunk_size = input.nbytes();
   bool has_input_scale = this->with_input_scale && input_scale.has_value();
 
@@ -874,6 +860,14 @@ AllGatherOp::AllGatherOpImpl::copy_ring_push_by_kernel(
     c10::optional<torch::Tensor> input_scale,
     bool use_2d_mode,
     cudaStream_t stream) {
+
+  std::cout << "[AG DEBUG] copy_ring_push_by_kernel"
+          << " rank=" << this->rank
+          << " world_size=" << this->world_size
+          << " SPLIT=" << SPLIT
+          << " use_2d_mode=" << use_2d_mode
+          << " input_nbytes=" << input.nbytes()
+          << std::endl;
   bool has_input_scale = input_scale.has_value();
   // use d2d copy kernel for s8 gemm
   c10::ScalarType torch_scale_dtype =
