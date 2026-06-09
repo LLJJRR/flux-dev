@@ -8,7 +8,7 @@ set -x
 
 FLUX_DIR=/root/flux
 VENV_DIR=/root/venv-flux
-JOBS=${JOBS:-8}
+JOBS=${JOBS:-16}
 
 ########################################
 # CHECK

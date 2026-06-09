@@ -14,7 +14,9 @@
 // limitations under the License.
 //
 //===----------------------------------------------------------------------===//
+#include <cstdlib>
 #include <iostream>
+#include <vector>
 #include "coll/all_gather_impls.hpp"
 #include "coll/local_copy_and_reset.hpp"
 #include "coll/ths_op/all_gather_op.h"
@@ -47,15 +49,24 @@ inline bool ag_event_profile_enabled() {
   return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
 }
 
+struct AgRecordedEvent {
+  const char *name;
+  int rank;
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+};
+
+static thread_local std::vector<AgRecordedEvent> g_ag_recorded_events;
+
 struct AgEventTimer {
-  const char* name;
+  const char *name;
   int rank;
   cudaStream_t stream;
   cudaEvent_t start{};
   cudaEvent_t stop{};
   bool enabled;
 
-  AgEventTimer(const char* name_, int rank_, cudaStream_t stream_)
+  AgEventTimer(const char *name_, int rank_, cudaStream_t stream_)
       : name(name_),
         rank(rank_),
         stream(stream_),
@@ -73,18 +84,7 @@ struct AgEventTimer {
     }
 
     CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-
-    std::cout << "[AG EVENT] rank=" << rank
-              << " name=" << name
-              << " ms=" << ms
-              << std::endl;
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    g_ag_recorded_events.push_back(AgRecordedEvent{name, rank, start, stop});
   }
 };
 
@@ -127,6 +127,28 @@ get_scale_split_range(
 }
 
 }  // namespace
+
+void
+flush_ag_events_after_sync() {
+  if (!ag_event_profile_enabled()) {
+    return;
+  }
+
+  for (auto &event : g_ag_recorded_events) {
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));
+
+    std::cout << "[AG EVENT] rank=" << event.rank
+              << " name=" << event.name
+              << " ms=" << ms
+              << std::endl;
+
+    CUDA_CHECK(cudaEventDestroy(event.start));
+    CUDA_CHECK(cudaEventDestroy(event.stop));
+  }
+
+  g_ag_recorded_events.clear();
+}
 
 class AllGatherOp::AllGatherOpImpl {
  public:

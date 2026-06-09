@@ -56,6 +56,8 @@ namespace flux {
 namespace ths_op {
 using torch::Tensor;
 
+void flush_ag_events_after_sync();
+
 namespace {
 inline void *
 ptr_offset(void *ptr, ptrdiff_t offset) {
@@ -67,46 +69,36 @@ agk_event_profile_enabled() {
   return std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
 }
 
-struct AGKernelEventTimer {
-  const char *name;
-  int rank;
-  cudaStream_t stream;
-  cudaEvent_t start{};
-  cudaEvent_t stop{};
-  bool enabled;
+inline bool
+ag_event_profile_enabled_for_flush() {
+  return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
+}
 
-  AGKernelEventTimer(const char *name_, int rank_, cudaStream_t stream_)
-      : name(name_),
-        rank(rank_),
-        stream(stream_),
-        enabled(agk_event_profile_enabled()) {
-    if (enabled) {
-      CUDA_CHECK(cudaEventCreate(&start));
-      CUDA_CHECK(cudaEventCreate(&stop));
-      CUDA_CHECK(cudaEventRecord(start, stream));
-    }
-  }
+inline void
+agk_event_create(cudaEvent_t *event) {
+  CUDA_CHECK(cudaEventCreate(event));
+}
 
-  ~AGKernelEventTimer() {
-    if (!enabled) {
-      return;
-    }
+inline void
+agk_event_destroy(cudaEvent_t event) {
+  CUDA_CHECK(cudaEventDestroy(event));
+}
 
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+inline void
+agk_event_record(cudaEvent_t event, cudaStream_t stream) {
+  CUDA_CHECK(cudaEventRecord(event, stream));
+}
 
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+inline void
+agk_event_print(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop) {
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
-    std::cout << "[AGK EVENT] rank=" << rank
-              << " name=" << name
-              << " ms=" << ms
-              << std::endl;
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-  }
-};
+  std::cout << "[AGK EVENT] rank=" << rank
+            << " name=" << name
+            << " ms=" << ms
+            << std::endl;
+}
 
 }  // namespace
 
@@ -223,18 +215,26 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> output_scale,
       bool fast_accum,
       bool transpose_weight) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int rank = this->tp_group->get_rank();
+    bool prof = agk_event_profile_enabled();
 
-      cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  AGKernelEventTimer timer(
-      "AGK_gemm_only_total",
-      this->tp_group->get_rank(),
-      stream);
+    cudaEvent_t gemm_only_start{};
+    cudaEvent_t gemm_only_stop{};
+
+    if (prof) {
+      agk_event_create(&gemm_only_start);
+      agk_event_create(&gemm_only_stop);
+      agk_event_record(gemm_only_start, stream);
+    }
+
     torch::Tensor barrier = torch::ones(
         {this->world_size},
         at::TensorOptions(at::ScalarType::Int)
             .device(torch::kCUDA)
             .device_index(at::cuda::current_device()));
-    return this->gemm_op.forward(
+
+    auto result = this->gemm_op.forward(
         input,  // never mind the result
         weight,
         bias,
@@ -246,6 +246,18 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         fast_accum,
         nullptr,
         transpose_weight);
+
+    if (prof) {
+      agk_event_record(gemm_only_stop, stream);
+      CUDA_CHECK(cudaEventSynchronize(gemm_only_stop));
+
+      agk_event_print(rank, "AGK_gemm_only_total", gemm_only_start, gemm_only_stop);
+
+      agk_event_destroy(gemm_only_start);
+      agk_event_destroy(gemm_only_stop);
+    }
+
+    return result;
   }
 
   torch::Tensor
@@ -311,12 +323,37 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> gathered_input,
       c10::optional<UnifiedGemmHParams> const &hparams,
       cudaStream_t stream) {
+    int rank = this->tp_group->get_rank();
+    bool agk_prof = agk_event_profile_enabled();
+    bool ag_prof = ag_event_profile_enabled_for_flush();
+    bool prof = agk_prof || ag_prof;
 
-      int rank = this->tp_group->get_rank();
-  AGKernelEventTimer total_timer(
-      "AGK_forward_default_total",
-      rank,
-      stream);
+    cudaEvent_t fwd_start{};
+    cudaEvent_t fwd_stop{};
+    cudaEvent_t cp_ag_start{};
+    cudaEvent_t cp_ag_stop{};
+    cudaEvent_t wait_local_start{};
+    cudaEvent_t wait_local_stop{};
+    cudaEvent_t gemm_start{};
+    cudaEvent_t gemm_stop{};
+    cudaEvent_t gathered_copy_start{};
+    cudaEvent_t gathered_copy_stop{};
+
+    if (prof) {
+      agk_event_create(&fwd_start);
+      agk_event_create(&fwd_stop);
+      agk_event_create(&cp_ag_start);
+      agk_event_create(&cp_ag_stop);
+      agk_event_create(&wait_local_start);
+      agk_event_create(&wait_local_stop);
+      agk_event_create(&gemm_start);
+      agk_event_create(&gemm_stop);
+      agk_event_create(&gathered_copy_start);
+      agk_event_create(&gathered_copy_stop);
+
+      agk_event_record(fwd_start, stream);
+    }
+
     torch::Tensor barrier = ag_op.local_barrier_buffer();
     int M = input.size(0) * this->world_size;
     torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
@@ -332,47 +369,56 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     CUDA_CHECK(cudaEventRecord(this->ready_event, stream));
     CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream, this->ready_event));
 
-    {
-      AGKernelEventTimer ag_timer(
-          "AGK_ag_op_run_cp_stream_total",
-          rank,
-          this->cp_stream);
-
-      ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+    if (prof) {
+      agk_event_record(cp_ag_start, this->cp_stream);
     }
 
-    {
-      AGKernelEventTimer wait_local_prepare_timer(
-          "AGK_wait_local_prepare_event",
-          rank,
-          stream);
+    ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
 
-      CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+    if (prof) {
+      agk_event_record(cp_ag_stop, this->cp_stream);
+    }
+
+    if (prof) {
+      agk_event_record(wait_local_start, stream);
+    }
+
+    CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+
+    if (prof) {
+      agk_event_record(wait_local_stop, stream);
     }
 
     torch::Tensor result;
-    {
-      AGKernelEventTimer gemm_timer(
-          "AGK_gemm_op_forward_total",
-          rank,
-          stream);
 
-      result = this->gemm_op.forward(
-          input_buffer,
-          std::move(weight),
-          std::move(bias),
-          std::move(output),
-          input_scale_tensor,
-          std::move(weight_scale),
-          std::move(output_scale),
-          barrier,
-          fast_accum,
-          transpose_weight,
-          hparams,
-          opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
-          stream);
+    if (prof) {
+      agk_event_record(gemm_start, stream);
     }
+
+    result = this->gemm_op.forward(
+        input_buffer,
+        std::move(weight),
+        std::move(bias),
+        std::move(output),
+        input_scale_tensor,
+        std::move(weight_scale),
+        std::move(output_scale),
+        barrier,
+        fast_accum,
+        transpose_weight,
+        hparams,
+        opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
+        stream);
+
+    if (prof) {
+      agk_event_record(gemm_stop, stream);
+    }
+
     if (gathered_input.has_value()) {
+      if (prof) {
+        agk_event_record(gathered_copy_start, stream);
+      }
+
       CHECK_INPUT(gathered_input.value(), input.scalar_type());
       CHECK_2D(gathered_input.value(), input.size(0) * this->world_size, input.size(1));
       CUDA_CHECK(cudaMemcpyAsync(
@@ -381,7 +427,50 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           gathered_input->nbytes(),
           cudaMemcpyDeviceToDevice,
           stream));
+
+      if (prof) {
+        agk_event_record(gathered_copy_stop, stream);
+      }
     }
+
+    if (prof) {
+      agk_event_record(fwd_stop, stream);
+
+      // Synchronize once, after the original forward work has been enqueued.
+      CUDA_CHECK(cudaEventSynchronize(fwd_stop));
+      CUDA_CHECK(cudaEventSynchronize(cp_ag_stop));
+
+      // AG events are recorded in all_gather_op.cc. They are safe to flush now
+      // because cp_ag_stop guarantees the AG stream has reached the end of ag_op.run().
+      flush_ag_events_after_sync();
+
+      if (agk_prof) {
+        agk_event_print(rank, "AGK_forward_default_total", fwd_start, fwd_stop);
+        agk_event_print(rank, "AGK_cp_stream_ag_op_run_total", cp_ag_start, cp_ag_stop);
+        agk_event_print(rank, "AGK_wait_local_prepare_event", wait_local_start, wait_local_stop);
+        agk_event_print(rank, "AGK_forward_gemm_op_forward_total", gemm_start, gemm_stop);
+
+        if (gathered_input.has_value()) {
+          agk_event_print(
+              rank,
+              "AGK_gathered_input_copy_total",
+              gathered_copy_start,
+              gathered_copy_stop);
+        }
+      }
+
+      agk_event_destroy(fwd_start);
+      agk_event_destroy(fwd_stop);
+      agk_event_destroy(cp_ag_start);
+      agk_event_destroy(cp_ag_stop);
+      agk_event_destroy(wait_local_start);
+      agk_event_destroy(wait_local_stop);
+      agk_event_destroy(gemm_start);
+      agk_event_destroy(gemm_stop);
+      agk_event_destroy(gathered_copy_start);
+      agk_event_destroy(gathered_copy_stop);
+    }
+
     return result;
   }
 
