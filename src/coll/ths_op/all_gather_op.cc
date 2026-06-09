@@ -43,6 +43,51 @@ namespace {
 constexpr int SPLIT = ::bytedance::flux::kAGGemmSplit;
 constexpr int kNumSignals = ::bytedance::flux::kAGGemmNumSignals;
 
+inline bool ag_event_profile_enabled() {
+  return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
+}
+
+struct AgEventTimer {
+  const char* name;
+  int rank;
+  cudaStream_t stream;
+  cudaEvent_t start{};
+  cudaEvent_t stop{};
+  bool enabled;
+
+  AgEventTimer(const char* name_, int rank_, cudaStream_t stream_)
+      : name(name_),
+        rank(rank_),
+        stream(stream_),
+        enabled(ag_event_profile_enabled()) {
+    if (enabled) {
+      CUDA_CHECK(cudaEventCreate(&start));
+      CUDA_CHECK(cudaEventCreate(&stop));
+      CUDA_CHECK(cudaEventRecord(start, stream));
+    }
+  }
+
+  ~AgEventTimer() {
+    if (!enabled) {
+      return;
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    std::cout << "[AG EVENT] rank=" << rank
+              << " name=" << name
+              << " ms=" << ms
+              << std::endl;
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+  }
+};
+
 struct SplitRange {
   size_t offset;
   size_t bytes;
@@ -480,14 +525,10 @@ AllGatherOp::AllGatherOpImpl::copy_local_and_sync_with_cudaMemcpyAsync(
     bool use_cuda_core_ag,
     cudaStream_t stream) {
 
-  std::cout << "[AG DEBUG] copy_local_and_sync_with_cudaMemcpyAsync"
-          << " rank=" << this->rank
-          << " world_size=" << this->world_size
-          << " SPLIT=" << SPLIT
-          << " is_input_buffer_copied=" << is_input_buffer_copied
-          << " use_cuda_core_ag=" << use_cuda_core_ag
-          << " input_nbytes=" << input.nbytes()
-          << std::endl;
+  AgEventTimer timer(
+    "copy_local_and_sync_with_cudaMemcpyAsync_total",
+    this->rank,
+    stream);
 
   size_t chunk_size = input.nbytes();
   void *input_ptr = input.data_ptr();
@@ -621,14 +662,11 @@ AllGatherOp::AllGatherOpImpl::copy_all_to_all(
     bool use_cuda_core,
     cudaStream_t stream) {
 
-  std::cout << "[AG DEBUG] copy_all_to_all"
-          << " rank=" << this->rank
-          << " world_size=" << this->world_size
-          << " SPLIT=" << SPLIT
-          << " use_cuda_core=" << use_cuda_core
-          << " input_nbytes=" << input.nbytes()
-          << std::endl;
-          
+  AgEventTimer timer(
+      "copy_all_to_all_total",
+      this->rank,
+      stream);
+
   size_t chunk_size = input.nbytes();
   bool has_input_scale = this->with_input_scale && input_scale.has_value();
 
