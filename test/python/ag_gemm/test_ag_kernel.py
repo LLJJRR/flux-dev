@@ -365,6 +365,7 @@ def perf_flux(
     use_cuda_core_local: bool = False,
     use_cuda_core_ag: bool = False,
     use_pdl: bool = False,
+    tune_agk=False,
 ):
     input_dtype = input.dtype
     is_fp8 = is_fp8_dtype(input_dtype)
@@ -422,6 +423,46 @@ def perf_flux(
         output_dtype=output_dtype,
         use_pdl=use_pdl,
     )
+
+    ag_option.use_cuda_core_local = use_cuda_core_local
+    ag_option.use_cuda_core_ag = use_cuda_core_ag
+
+    if tune_agk:
+        torch.distributed.barrier()
+        torch.cuda.current_stream().synchronize()
+
+        if TP_GROUP.rank() == 0:
+            print(
+                "[AGK TUNE] start AGKernel profiling "
+                f"M={M}, N={N}, K={K}, dtype={input_dtype}, "
+                f"transpose_weight={transpose_weight}, "
+                f"use_cuda_core_local={use_cuda_core_local}, "
+                f"use_cuda_core_ag={use_cuda_core_ag}, "
+                f"use_pdl={use_pdl}"
+            )
+
+        prof_ctx = flux.ProfilingContext(f"ag_kernel_tune_M{M}_N{N}_K{K}")
+
+        _ = all_gather_gemm_kernel.profiling(
+            input,
+            w,
+            bias=bias,
+            output=ag_gemm_output,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=fast_acc,
+            transpose_weight=transpose_weight,
+            all_gather_option=ag_option,
+            gathered_input=full_input if gather_input else None,
+            prof_ctx=prof_ctx,
+        )
+
+        torch.cuda.current_stream().synchronize()
+        torch.distributed.barrier()
+
+        if TP_GROUP.rank() == 0:
+            print("[AGK TUNE] finish AGKernel profiling")
 
     warmup_iters = warmup
     total_iters = warmup_iters + iters if not verify else 1
@@ -544,6 +585,12 @@ def parse_args():
     parser.add_argument("--dtype", default="bfloat16", type=str, help="data type")
     parser.add_argument(
         "--profile", default=False, action="store_true", help="dump torch.profiler.profile"
+    )
+    parser.add_argument(
+        "--tune-agk",
+        default=False,
+        action="store_true",
+        help="run AGKernel hparams profiling before benchmark",
     )
     parser.add_argument(
         "--transpose_weight",
@@ -708,6 +755,7 @@ if __name__ == "__main__":
             args.use_cuda_core_local,
             args.use_cuda_core_ag,
             args.use_pdl,
+            args.tune_agk,
         )
 
         perf_res_flux_no_overlap = perf_flux_no_overlap(
