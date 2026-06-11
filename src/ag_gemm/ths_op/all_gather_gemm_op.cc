@@ -53,6 +53,9 @@
 
 namespace bytedance {
 namespace flux {
+
+void flush_gwb_events_after_sync();
+
 namespace ths_op {
 using torch::Tensor;
 
@@ -72,6 +75,12 @@ agk_event_profile_enabled() {
 inline bool
 ag_event_profile_enabled_for_flush() {
   return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
+}
+
+inline bool
+gwb_event_profile_enabled_for_flush() {
+  return std::getenv("FLUX_GWB_EVENT_PROFILE") != nullptr ||
+         std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
 }
 
 inline void
@@ -251,6 +260,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_record(gemm_only_stop, stream);
       CUDA_CHECK(cudaEventSynchronize(gemm_only_stop));
 
+      ::bytedance::flux::flush_gwb_events_after_sync();
+
       agk_event_print(rank, "AGK_gemm_only_total", gemm_only_start, gemm_only_stop);
 
       agk_event_destroy(gemm_only_start);
@@ -326,7 +337,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     int rank = this->tp_group->get_rank();
     bool agk_prof = agk_event_profile_enabled();
     bool ag_prof = ag_event_profile_enabled_for_flush();
-    bool prof = agk_prof || ag_prof;
+    bool gwb_prof = gwb_event_profile_enabled_for_flush();
+    bool prof = agk_prof || ag_prof || gwb_prof;
 
     cudaEvent_t fwd_start{};
     cudaEvent_t fwd_stop{};
@@ -439,6 +451,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       // Synchronize once, after the original forward work has been enqueued.
       CUDA_CHECK(cudaEventSynchronize(fwd_stop));
       CUDA_CHECK(cudaEventSynchronize(cp_ag_stop));
+
+      // GWB events are recorded in gemm_with_barrier.cc. They are safe to flush now
+      // because fwd_stop guarantees the main stream has reached the end of gemm_op.forward().
+      ::bytedance::flux::flush_gwb_events_after_sync();
 
       // AG events are recorded in all_gather_op.cc. They are safe to flush now
       // because cp_ag_stop guarantees the AG stream has reached the end of ag_op.run().

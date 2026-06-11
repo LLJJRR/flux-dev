@@ -18,15 +18,77 @@
 
 #include <c10/cuda/CUDAStream.h>
 
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+#include <cuda_runtime_api.h>
+
 #include "coll/ths_op/all_gather_types.h"
 #include "flux/args/ag_gemm.h"
 #include "flux/cuda/cuda_stub.h"
+#include "flux/cuda/cuda_common.h"
 #include "flux/flux.h"
 #include "flux/gemm_meta.h"
 #include "flux/ths_op/ths_op.h"
 #include "flux/ths_op/util.h"
 
 namespace bytedance::flux {
+
+namespace {
+
+struct GWBRecordedEvent {
+  int rank;
+  const char *name;
+  cudaEvent_t start;
+  cudaEvent_t stop;
+};
+
+static thread_local std::vector<GWBRecordedEvent> g_gwb_events;
+
+inline bool
+gwb_event_profile_enabled() {
+  static const bool enabled =
+      std::getenv("FLUX_GWB_EVENT_PROFILE") != nullptr ||
+      std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
+  return enabled;
+}
+
+inline void
+gwb_event_create(cudaEvent_t *event) {
+  CUDA_CHECK(cudaEventCreate(event));
+}
+
+inline void
+gwb_event_record(cudaEvent_t event, cudaStream_t stream) {
+  CUDA_CHECK(cudaEventRecord(event, stream));
+}
+
+inline void
+gwb_event_push(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop) {
+  g_gwb_events.push_back(GWBRecordedEvent{rank, name, start, stop});
+}
+
+}  // namespace
+
+void
+flush_gwb_events_after_sync() {
+  if (!gwb_event_profile_enabled()) {
+    return;
+  }
+
+  for (auto &e : g_gwb_events) {
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, e.start, e.stop));
+    std::cout << "[GWB EVENT] rank=" << e.rank
+              << " name=" << e.name
+              << " ms=" << ms
+              << std::endl;
+    CUDA_CHECK(cudaEventDestroy(e.start));
+    CUDA_CHECK(cudaEventDestroy(e.stop));
+  }
+
+  g_gwb_events.clear();
+}
 
 AGGemmMeta
 get_gemm_meta(
@@ -139,6 +201,30 @@ GemmWithBarirer::forward(
     c10::optional<UnifiedGemmHParams> const &hparams,
     int32_t *producer_signal,
     cudaStream_t stream) {
+  const bool prof = gwb_event_profile_enabled();
+  const bool has_producer_signal = producer_signal != nullptr;
+
+  cudaEvent_t fwd_start{}, fwd_stop{};
+  cudaEvent_t init_start{}, init_stop{};
+  cudaEvent_t signal_wait_start{}, signal_wait_stop{};
+  cudaEvent_t run_start{}, run_stop{};
+
+  if (prof) {
+    gwb_event_create(&fwd_start);
+    gwb_event_create(&fwd_stop);
+    gwb_event_create(&init_start);
+    gwb_event_create(&init_stop);
+    gwb_event_create(&run_start);
+    gwb_event_create(&run_stop);
+    if (has_producer_signal) {
+      gwb_event_create(&signal_wait_start);
+      gwb_event_create(&signal_wait_stop);
+    }
+
+    gwb_event_record(fwd_start, stream);
+    gwb_event_record(init_start, stream);
+  }
+
   auto output_tensor = this->initialize(
       input,
       weight,
@@ -153,14 +239,47 @@ GemmWithBarirer::forward(
       hparams,
       stream);
 
+  if (prof) {
+    gwb_event_record(init_stop, stream);
+  }
+
   // if not a nullptr, gemm need to wait producer kernel to be launch.
-  if (producer_signal != nullptr) {
+  if (has_producer_signal) {
+    if (prof) {
+      gwb_event_record(signal_wait_start, stream);
+    }
+
     CU_CHECK(
         CUStreamWaitValue(stream, (CUdeviceptr)(producer_signal), 1, CU_STREAM_WAIT_VALUE_EQ));
+
+    if (prof) {
+      gwb_event_record(signal_wait_stop, stream);
+    }
   }
 
   /// GEMM
+  if (prof) {
+    gwb_event_record(run_start, stream);
+  }
+
   this->run(stream, /*launch_with_pdl=*/false);
+
+  if (prof) {
+    gwb_event_record(run_stop, stream);
+    gwb_event_record(fwd_stop, stream);
+
+    // Do not synchronize here. The caller already synchronizes the enclosing
+    // AGKernel event at the end of forward/gemm_only. We only save events and
+    // let flush_gwb_events_after_sync() print them after that outer sync.
+    gwb_event_push(this->rank, "GWB_forward_total", fwd_start, fwd_stop);
+    gwb_event_push(this->rank, "GWB_initialize_total", init_start, init_stop);
+    if (has_producer_signal) {
+      gwb_event_push(
+          this->rank, "GWB_producer_signal_wait_total", signal_wait_start, signal_wait_stop);
+    }
+    gwb_event_push(this->rank, "GWB_run_total", run_start, run_stop);
+  }
+
   return output_tensor;
 }
 
