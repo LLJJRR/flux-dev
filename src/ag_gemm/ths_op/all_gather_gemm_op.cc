@@ -50,6 +50,8 @@
 #include <torch/all.h>
 
 #include <iostream>
+#include <sstream>
+#include <variant>
 
 namespace bytedance {
 namespace flux {
@@ -107,6 +109,81 @@ agk_event_print(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop)
             << " name=" << name
             << " ms=" << ms
             << std::endl;
+}
+
+inline std::string
+debug_tile_shape_to_string(UnifiedTileShape const &shape) {
+  std::ostringstream os;
+  os << "(" << cute::get<0>(shape) << "," << cute::get<1>(shape) << ","
+     << cute::get<2>(shape) << ")";
+  return os.str();
+}
+
+inline std::string
+debug_impl_hparams_value_to_string(None const &) {
+  return "None";
+}
+
+inline std::string
+debug_impl_hparams_value_to_string(unified_type_t<GemmV2HParams> const &v) {
+  std::ostringstream os;
+  os << "GemmV2HParams{"
+     << "warp_shape=" << debug_tile_shape_to_string(v.warp_shape())
+     << ", instruction_shape=" << debug_tile_shape_to_string(v.instruction_shape())
+     << ", streamk_mode=" << static_cast<int>(v.streamk_mode()) << "}";
+  return os.str();
+}
+
+inline std::string
+debug_impl_hparams_value_to_string(unified_type_t<GemmV3HParams> const &v) {
+  std::ostringstream os;
+  os << "GemmV3HParams{"
+     << "cluster_shape=" << debug_tile_shape_to_string(v.cluster_shape())
+     << ", kernel_schedule=" << static_cast<int>(v.kernel_schedule())
+     << ", blockscale_M=" << static_cast<int>(v.blockscale_M())
+     << ", blockscale_N=" << static_cast<int>(v.blockscale_N()) << "}";
+  return os.str();
+}
+
+inline std::string
+debug_impl_hparams_to_string(UnifiedImplHParams const &impl_spec) {
+  return std::visit(
+      [](auto const &v) -> std::string { return debug_impl_hparams_value_to_string(v); },
+      impl_spec);
+}
+
+inline std::string
+debug_comm_hparams_value_to_string(None const &) {
+  return "None";
+}
+
+inline std::string
+debug_comm_hparams_value_to_string(unified_type_t<GatherRSHParams> const &v) {
+  std::ostringstream os;
+  os << "GatherRSHParams{"
+     << "gather_rs_ctas=" << v.gather_rs_ctas()
+     << ", n_dim_per_split=" << v.n_dim_per_split() << "}";
+  return os.str();
+}
+
+inline std::string
+debug_comm_hparams_to_string(UnifiedCommHParams const &comm_spec) {
+  return std::visit(
+      [](auto const &v) -> std::string { return debug_comm_hparams_value_to_string(v); },
+      comm_spec);
+}
+
+inline std::string
+debug_hparams_to_string(UnifiedGemmHParams const &hparams) {
+  std::ostringstream os;
+  os << "{"
+     << "impl_spec=" << debug_impl_hparams_to_string(hparams.impl_spec())
+     << ", comm_spec=" << debug_comm_hparams_to_string(hparams.comm_spec())
+     << ", tile_shape=" << debug_tile_shape_to_string(hparams.tile_shape())
+     << ", gemm_kind=" << static_cast<int>(hparams.gemm_kind())
+     << ", mainloop_stage=" << hparams.mainloop_stage()
+     << ", raster_order=" << static_cast<int>(hparams.raster_order()) << "}";
+  return os.str();
 }
 
 }  // namespace
@@ -640,11 +717,32 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
 
           float avg_elapsed = int(total_elapsed / iters * 1000) / 1000.0;
           float reduce_elapsed = all_reduce_max_float(this->tp_group.get(), avg_elapsed);
+
+          if (this->tp_group->get_rank() == 0) {
+            std::cout << "[AGK PROFILE] "
+                      << "M=" << M
+                      << " N=" << n
+                      << " K=" << k
+                      << " elapsed_ms=" << reduce_elapsed
+                      << " hparams=" << debug_hparams_to_string(hparams)
+                      << std::endl;
+          }
+
           ctx->add(meta, rt_config, hparams, reduce_elapsed);
         },
         meta);
 
     auto best_hparams = ctx->record_best(meta, rt_config);
+
+    if (this->tp_group->get_rank() == 0) {
+      std::cout << "[AGK PROFILE] "
+                << "M=" << M
+                << " N=" << n
+                << " K=" << k
+                << " best_hparams=" << debug_hparams_to_string(best_hparams)
+                << std::endl;
+    }
+
     return this->forward_impl(
         std::move(input),
         std::move(weight),
