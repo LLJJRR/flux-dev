@@ -29,6 +29,7 @@
 #include "flux/cuda/cuda_common.h"
 #include "flux/flux.h"
 #include "flux/gemm_meta.h"
+#include "flux/gemm_hparams.h"
 #include "flux/ths_op/ths_op.h"
 #include "flux/ths_op/util.h"
 
@@ -51,6 +52,11 @@ gwb_event_profile_enabled() {
       std::getenv("FLUX_GWB_EVENT_PROFILE") != nullptr ||
       std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
   return enabled;
+}
+
+inline bool
+force_h100_agk_best_hparams_enabled() {
+  return std::getenv("FLUX_FORCE_H100_AGK_BEST_HPARAMS") != nullptr;
 }
 
 inline void
@@ -343,8 +349,55 @@ GemmWithBarirer::initialize(
   if (hparams.has_value()) {
     this->cutlass_op = OpRegistry::instance().get_op(meta, hparams.value());
   } else {
-    auto params = OpRegistry::instance().get_hparams(meta, rt_config);
-    this->cutlass_op = OpRegistry::instance().get_op(meta, params);
+    // Temporary H100 / SM90 AGKernel override for validating the profiled best hparams.
+    // Enable with:
+    //   FLUX_FORCE_H100_AGK_BEST_HPARAMS=1
+    // This only affects the exact BF16 AGKernel shape used in the current experiment:
+    //   M=2048, N=24576, K=12288, TP=2, nnodes=1, transpose_weight=true.
+    const bool force_h100_agk_best_hparams =
+        force_h100_agk_best_hparams_enabled() &&
+        get_arch() == ArchEnum::Sm90 &&
+        input_dtype == at::ScalarType::BFloat16 &&
+        output_dtype == at::ScalarType::BFloat16 &&
+        transpose_weight &&
+        !bias.has_value() &&
+        !fast_accum &&
+        this->world_size == 2 &&
+        this->nnodes == 1 &&
+        m == 2048 &&
+        n == 24576 &&
+        k == 12288;
+
+    if (force_h100_agk_best_hparams) {
+      auto params = unify_type(make_gemm_hparams(
+          make_gemm_v3_hparams(cute::make_tuple(2l, 1l, 1l), _Cooperative{}()),
+          None{},
+          cute::make_tuple(256l, 128l, 64l),
+          _GemmDefault{}(),
+          4,
+          _RasterAlongN{}()));
+
+      static bool printed_force_hparams = false;
+      if (this->rank == 0 && !printed_force_hparams) {
+        std::cout << "[GWB FORCE HPARAMS] use profiled best hparams for "
+                  << "M=" << m
+                  << " N=" << n
+                  << " K=" << k
+                  << " world_size=" << this->world_size
+                  << " nnodes=" << this->nnodes
+                  << " cluster_shape=(2,1,1)"
+                  << " tile_shape=(256,128,64)"
+                  << " mainloop_stage=4"
+                  << " raster_order=RasterAlongN"
+                  << std::endl;
+        printed_force_hparams = true;
+      }
+
+      this->cutlass_op = OpRegistry::instance().get_op(meta, params);
+    } else {
+      auto params = OpRegistry::instance().get_hparams(meta, rt_config);
+      this->cutlass_op = OpRegistry::instance().get_op(meta, params);
+    }
   }
   torch::Tensor output_tensor;
 
