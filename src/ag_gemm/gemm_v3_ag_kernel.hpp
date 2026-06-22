@@ -17,6 +17,8 @@
 
 #pragma once
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include "cute/container/tuple.hpp"
 #include "flux/flux.h"
 #include "flux/gemm_meta.h"
@@ -53,6 +55,24 @@ struct TileSchedulerSelector<AGKernelStreamKScheduler, ArchTag, TileShape, Clust
 
 namespace bytedance::flux {
 using SystemBarrier = cutlass::Barrier;
+
+template <class T, class = void>
+struct HasAGWaitProfileFields : std::false_type {};
+
+template <class T>
+struct HasAGWaitProfileFields<
+    T,
+    std::void_t<decltype(std::declval<T &>().prof_wait_cycles)>> : std::true_type {};
+
+template <class GemmArguments, class Args>
+void
+set_ag_wait_profile_args(GemmArguments &gemm_args, Args const &args) {
+  if constexpr (HasAGWaitProfileFields<GemmArguments>::value) {
+    gemm_args.prof_wait_cycles = args.prof_wait_cycles;
+    gemm_args.prof_wait_count = args.prof_wait_count;
+    gemm_args.prof_tile_count = args.prof_tile_count;
+  }
+}
 
 template <class GemmMetaT, class GemmHParamsT>
 struct GemmV3AGKernel_Kernel : public GemmV3BaseKernel<GemmMetaT, GemmHParamsT> {
@@ -190,16 +210,20 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
       scheduler.local_rank = args.rank % scheduler.local_world_size;
     }
 
-    return GemmArguments{/*mode=*/cutlass::gemm::GemmUniversalMode::kGemm,
-                         /*problem_shape=*/{args.m, args.n, args.k},
-                         /*mainloop=*/
-                         {ptr_A, stride_A, ptr_B, stride_B},
-                         /*epilogue=*/epilogue,
-                         /*hw_info=*/{},
-                         /*scheduler=*/scheduler,
-                         args.barrier_buffer,
-                         args.rank,
-                         args.world_size};
+    auto gemm_args =
+        GemmArguments{/*mode=*/cutlass::gemm::GemmUniversalMode::kGemm,
+                      /*problem_shape=*/{args.m, args.n, args.k},
+                      /*mainloop=*/
+                      {ptr_A, stride_A, ptr_B, stride_B},
+                      /*epilogue=*/epilogue,
+                      /*hw_info=*/{},
+                      /*scheduler=*/scheduler,
+                      args.barrier_buffer,
+                      args.rank,
+                      args.world_size};
+
+    set_ag_wait_profile_args(gemm_args, args);
+    return gemm_args;
   }
 
   auto
@@ -254,16 +278,20 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
       scheduler.local_world_size = args.world_size / args.nnodes;
       scheduler.local_rank = args.rank % scheduler.local_world_size;
     }
-    return GemmArguments{/*mode=*/cutlass::gemm::GemmUniversalMode::kGemm,
-                         /*problem_shape=*/{args.m, args.n, args.k},
-                         /*mainloop=*/
-                         {ptr_A, stride_A, ptr_B, stride_B},
-                         /*epilogue=*/epilogue,
-                         /*hw_info=*/{},
-                         /*scheduler=*/scheduler,
-                         args.barrier_buffer,
-                         args.rank,
-                         args.world_size};
+    auto gemm_args =
+        GemmArguments{/*mode=*/cutlass::gemm::GemmUniversalMode::kGemm,
+                      /*problem_shape=*/{args.m, args.n, args.k},
+                      /*mainloop=*/
+                      {ptr_A, stride_A, ptr_B, stride_B},
+                      /*epilogue=*/epilogue,
+                      /*hw_info=*/{},
+                      /*scheduler=*/scheduler,
+                      args.barrier_buffer,
+                      args.rank,
+                      args.world_size};
+
+    set_ag_wait_profile_args(gemm_args, args);
+    return gemm_args;
   }
 
   auto

@@ -195,6 +195,10 @@ public:
     void *ptr_barrier = nullptr;
     int rank = 0;
     int world_size = 0;
+
+    uint64_t *prof_wait_cycles = nullptr;
+    uint32_t *prof_wait_count = nullptr;
+    uint32_t *prof_tile_count = nullptr;
   };
 
   // Kernel entry point API
@@ -211,6 +215,11 @@ public:
     int TILE_SIZE_M;
     int n_data_chunks;
     int m_per_data_chunk;
+
+    uint64_t *prof_wait_cycles = nullptr;
+    uint32_t *prof_wait_count = nullptr;
+    uint32_t *prof_tile_count = nullptr;
+
     void *workspace{nullptr};
   };
 
@@ -295,6 +304,9 @@ public:
         TILE_SIZE_M,
         n_data_chunks,
         m_per_data_chunk,
+        args.prof_wait_cycles,
+        args.prof_wait_count,
+        args.prof_tile_count,
         workspace};
   }
 
@@ -416,6 +428,25 @@ public:
     int thread_idx = int(threadIdx.x);
     int lane_idx = canonical_lane_idx();
     int warp_idx = canonical_warp_idx_sync();
+
+    auto record_wait_cycles = [&](int chunk_id, uint64_t cycles) {
+      if (thread_idx == 0 && params.prof_wait_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_cycles[chunk_id]),
+              static_cast<unsigned long long>(cycles));
+          atomicAdd(&params.prof_wait_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto record_tile_count = [&](int chunk_id) {
+      if (thread_idx == 0 && params.prof_tile_count != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(&params.prof_tile_count[chunk_id], 1u);
+        }
+      }
+    };
     int warp_idx_in_warp_group = warp_idx % NumWarpsPerWarpGroup;
     int warp_group_thread_idx = thread_idx % NumThreadsPerWarpGroup;
     int mma_thread_idx = thread_idx % NumMMAThreads;
@@ -543,12 +574,11 @@ public:
 
     // for stream k, may be invalid work tile info(M/N/L/K_idx = -1).
     if (work_tile_info.is_valid()) {
-      if (data_chunk_id_start == data_chunk_id_end) {
-        SystemBarrier::wait_eq(params.ptr_barrier, thread_idx, data_chunk_id_end, 1);
-      } else {
-        for (int id = data_chunk_id_start; id <= data_chunk_id_end; ++id) {
-          SystemBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
-        }
+      for (int id = data_chunk_id_start; id <= data_chunk_id_end; ++id) {
+        uint64_t t0 = clock64();
+        SystemBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
+        uint64_t t1 = clock64();
+        record_wait_cycles(id, t1 - t0);
       }
     }
 
@@ -585,10 +615,17 @@ public:
                                       ? new_data_chunk_id_end
                                       : (params.n_data_chunks - 1);
 
+          for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+            record_tile_count(id);
+          }
+
           if (new_data_chunk_id_start != data_chunk_id_start ||
               new_data_chunk_id_end != data_chunk_id_end) {
             for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+              uint64_t t0 = clock64();
               WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
+              uint64_t t1 = clock64();
+              record_wait_cycles(id, t1 - t0);
             }
           }
 

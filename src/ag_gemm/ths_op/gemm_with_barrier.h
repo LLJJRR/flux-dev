@@ -36,8 +36,16 @@ class GemmWithBarirer {
   torch::Tensor gemm_buffer;
   OpRegistry::OpPtr cutlass_op;
 
+  // AG wait profiling buffers. Enabled only by FLUX_AG_WAIT_PROFILE=1.
+  torch::Tensor prof_wait_cycles_buffer;
+  torch::Tensor prof_wait_count_buffer;
+  torch::Tensor prof_tile_count_buffer;
+
  private:
   void lazy_init_gemm_buffer(torch::Tensor input, int64_t buffer_size);
+  void lazy_init_ag_wait_profile(torch::Tensor input, int n_data_chunks);
+  void reset_ag_wait_profile(cudaStream_t stream);
+  void dump_ag_wait_profile(cudaStream_t stream);
 
  public:
   GemmWithBarirer(int rank, int world_size, int32_t nnodes);
