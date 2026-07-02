@@ -51,10 +51,12 @@ ln -sf libnvshmem_host.so.3 libnvshmem_host.so
 cd ${FLUX_DIR}
 
 export NVSHMEM_HOME=${NVSHMEM_HOME}
+export NCCL_ROOT=${FLUX_DIR}/3rdparty/nccl/build/local
 
 export FLUX_SHM_USE_NVSHMEM=1
 
 export LD_LIBRARY_PATH=\
+${NCCL_ROOT}/lib:\
 ${NVSHMEM_HOME}/lib:\
 /usr/local/cuda/lib64:\
 ${LD_LIBRARY_PATH}
@@ -85,12 +87,27 @@ cat >/root/flux_env.sh <<EOF
 source ${VENV_DIR}/bin/activate
 
 export NVSHMEM_HOME=${NVSHMEM_HOME}
+export NCCL_ROOT=${NCCL_ROOT}
 
 export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
-export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NCCL_ROOT}/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
 
 export FLUX_SHM_USE_NVSHMEM=1
+
+# Enable this only when comparing the experimental NCCL-signal AG producer.
+# export FLUX_AG_USE_NCCL_SIGNAL=1
+#
+# Conservative correctness mode: GEMM waits for NCCL AllGather completion.
+# Leave unset for fused mode, where GEMM waits on NCCL-written barriers.
+# export FLUX_AG_NCCL_SIGNAL_WAIT=1
+
+# Recommended first-run NCCL settings for the experimental signal path.
+# export NCCL_ALGO=Ring
+# export NCCL_PROTO=Simple
+# export NCCL_IBGDA_ENABLE=0
+# export NCCL_NVLS_ENABLE=0
+# export NCCL_COLLNET_ENABLE=0
 EOF
 
 ########################################
