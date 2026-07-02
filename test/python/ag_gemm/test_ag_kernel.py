@@ -46,6 +46,14 @@ except Exception as e:
 print = partial(print, flush=True)
 
 
+def flux_ag_impl_name() -> str:
+    if os.getenv("FLUX_AG_USE_NCCL_SIGNAL") != "1":
+        return "flux"
+    if os.getenv("FLUX_AG_NCCL_SIGNAL_WAIT") == "1":
+        return "flux_nccl_signal_wait"
+    return "flux_nccl_signal_fused"
+
+
 class PerfResult:
     def __init__(
         self,
@@ -562,7 +570,7 @@ def perf_flux(
         print("is bitwise match: ", is_bitwise_match)
 
     return PerfResult(
-        name=f"flux  #{TP_GROUP.rank()}",
+        name=f"{flux_ag_impl_name()}  #{TP_GROUP.rank()}",
         output=ag_gemm_output,
         gathered_output=full_input,
         total_ms=ag_gemm_time_ms,
