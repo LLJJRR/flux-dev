@@ -24,6 +24,9 @@ set(FLUX_DEBUG
     CACHE INTERNAL "Define FLUX_DEBUG")
 option(WITH_PROTOBUF "build with protobuf" OFF)
 option(WITH_TRITON_AOT "build with triton Ahead-of-Time" OFF)
+set(NCCL_ROOT
+    "${PROJECT_SOURCE_DIR}/3rdparty/nccl/build/local"
+    CACHE PATH "NCCL installation root")
 message("PYTHONPATH: ${PYTHONPATH}")
 message("NVShmem Support: ${ENABLE_NVSHMEM}")
 
@@ -241,6 +244,8 @@ string(REGEX REPLACE "compute_90" "compute_90a" CMAKE_CUDA_FLAGS
                      ${CMAKE_CUDA_FLAGS})
 
 set(COMMON_HEADER_DIRS
+    ${NCCL_ROOT}/include
+    ${NCCL_ROOT}/include/nccl/detail/include
     ${PROJECT_SOURCE_DIR}/include
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_BINARY_DIR}
@@ -250,7 +255,9 @@ set(COMMON_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/tools/profiler/include)
 
 set(COMMON_LIB_DIRS "")
+list(APPEND COMMON_LIB_DIRS "${NCCL_ROOT}/lib")
 list(APPEND COMMON_LIB_DIRS "${CUDAToolkit_LIBRARY_DIR}")
+message(STATUS "NCCL root dir: ${NCCL_ROOT}")
 message(ENABLE_NVSHMEM "ENABLE_NVSHMEM is set to: ${ENABLE_NVSHMEM}")
 if(ENABLE_NVSHMEM)
   add_definitions(-DFLUX_SHM_USE_NVSHMEM)

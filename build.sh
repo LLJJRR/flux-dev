@@ -130,8 +130,8 @@ function build_protobuf() {
 }
 
 function build_nccl() {
-    pushd $NCCL_ROOT
-    export BUILDDIR=${NCCL_ROOT}/build
+    pushd $NCCL_SRC_ROOT
+    export BUILDDIR=${NCCL_SRC_ROOT}/build
     export PREFIX=${BUILDDIR}/local
 
     if [[ -n $ARCH ]]; then
@@ -141,9 +141,9 @@ function build_nccl() {
         for arch in "${arch_list[@]}"; do
             NCCL_COMPILE_OPTIONS_ARCH="-gencode=arch=compute_${arch},code=sm_${arch} ${NCCL_COMPILE_OPTIONS_ARCH}"
         done
-        make -j${nproc} src.staticlib NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
+        make -j${JOBS} src.staticlib NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
     else
-        make -j${nproc} src.staticlib VERBOSE=1
+        make -j${JOBS} src.staticlib VERBOSE=1
     fi
     # only install static lib
     mkdir -p ${PREFIX}/lib
@@ -163,6 +163,7 @@ function build_flux_cuda() {
             -DNVSHMEM_HOME=${NVSHMEM_HOME}
             -DCUDAARCHS=${ARCH}
             -DGPU_SM_CORES=${SM_CORES}
+            -DNCCL_ROOT=${NCCL_INSTALL_ROOT}
             -DCMAKE_EXPORT_COMPILE_COMMANDS=1
             -DBUILD_TEST=${BUILD_TEST}
             -DCMAKE_INSTALL_PREFIX=${LIBFLUX_PREFIX}
@@ -231,8 +232,10 @@ function build_flux_py {
 }
 
 trap merge_compile_commands EXIT
-NCCL_ROOT=$PROJECT_ROOT/3rdparty/nccl
+NCCL_SRC_ROOT=$PROJECT_ROOT/3rdparty/nccl
+NCCL_INSTALL_ROOT=${NCCL_SRC_ROOT}/build/local
 build_nccl
+export NCCL_ROOT=${NCCL_INSTALL_ROOT}
 
 if [ $ENABLE_NVSHMEM == "ON" ]; then
     if [ -n "$NVSHMEM_HOME" ]; then
