@@ -195,9 +195,11 @@ function build_flux_cuda() {
 
 function merge_compile_commands() {
     cd $SCRIPT_DIR
-    if command -v ninja >/dev/null 2>&1; then
+    local ths_build_ninja
+    ths_build_ninja=$(find ./build -path './build/temp.*/build.ninja' -print -quit 2>/dev/null || true)
+    if [[ -n "${ths_build_ninja}" ]] && command -v ninja >/dev/null 2>&1; then
         # generate compile_commands.json
-        ninja -f $(ls ./build/temp.*/build.ninja) -t compdb >build/compile_commands_ths_op.json
+        ninja -f "${ths_build_ninja}" -t compdb >build/compile_commands_ths_op.json
         cat >build/merge_compile_commands.py <<EOF
 import json
 with open("build/compile_commands.json") as f:
@@ -210,6 +212,8 @@ EOF
 
         python3 build/merge_compile_commands.py
         echo "merge compile_commands.json done"
+    elif [[ -z "${ths_build_ninja}" ]]; then
+        echo "skip merge_compile_commands: torch extension build.ninja not found"
     else
         echo "Ninja is not installed. Ninja is required for flux_ths_pybind's compile_commands.json. run 'pip3 install ninja'"
     fi
@@ -225,7 +229,11 @@ function build_flux_py {
     fi
     popd
     ##### build flux torch bindings #####
-    MAX_JOBS=${JOBS} python3 setup.py develop --user
+    PY_DEVELOP_ARGS=(develop)
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        PY_DEVELOP_ARGS+=(--user)
+    fi
+    MAX_JOBS=${JOBS} python3 setup.py "${PY_DEVELOP_ARGS[@]}"
     if [ $BDIST_WHEEL == "ON" ]; then
         MAX_JOBS=${JOBS} python3 setup.py bdist_wheel
     fi
