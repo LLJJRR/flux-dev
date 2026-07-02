@@ -1,0 +1,238 @@
+diff --git a/src/collectives.cc b/src/collectives.cc
+index 6ba66c9..0bb9b2b 100644
+--- a/src/collectives.cc
++++ b/src/collectives.cc
+@@ -149,6 +149,29 @@ ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcoun
+   return ncclEnqueueCheck(&info);
+ }
+ 
++NCCL_API(ncclResult_t, ncclAllGatherFluxSignal, const void* sendbuff, void* recvbuff, size_t sendcount,
++         ncclDataType_t datatype, const ncclFluxAgSignal_t* signal, ncclComm_t comm, cudaStream_t stream);
++ncclResult_t ncclAllGatherFluxSignal(const void* sendbuff, void* recvbuff, size_t sendcount, ncclDataType_t datatype,
++                                     const ncclFluxAgSignal_t* signal, ncclComm_t comm, cudaStream_t stream) {
++  NVTX3_FUNC_WITH_PARAMS(AllGather, NcclNvtxParamsAllGather,
++                         NVTX3_PAYLOAD(comm ? comm->commHash : 0, sendcount * ncclTypeSize(datatype)));
++
++  struct ncclInfo info = {ncclFuncAllGather,
++                          "AllGatherFluxSignal",
++                          sendbuff,
++                          recvbuff,
++                          sendcount,
++                          datatype,
++                          ncclSum,
++                          0,
++                          comm,
++                          stream,
++                          ALLGATHER_CHUNKSTEPS,
++                          ALLGATHER_SLICESTEPS};
++  info.fluxAgSignal = reinterpret_cast<uint64_t>(signal);
++  return ncclEnqueueCheck(&info);
++}
++
+ NCCL_API(ncclResult_t, ncclAlltoAll, const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
+          ncclComm* comm, cudaStream_t stream);
+ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, ncclComm* comm,
+diff --git a/src/device/all_gather.h b/src/device/all_gather.h
+index 912dd21..51c5ff6 100644
+--- a/src/device/all_gather.h
++++ b/src/device/all_gather.h
+@@ -10,6 +10,36 @@
+ #include "primitives.h"
+ 
+ namespace {
++struct ncclFluxAgSignalDev {
++  int* barrier;
++  int* counters;
++  int* launchSignal;
++  int split;
++};
++
++__device__ __forceinline__ void fluxAgStoreRelease(int* ptr, int value) {
++#if __CUDA_ARCH__ >= 700
++  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(ptr), "r"(value) : "memory");
++#else
++  __threadfence_system();
++  *(volatile int*)ptr = value;
++#endif
++}
++
++__device__ __forceinline__ void fluxAgSignalLaunch(uint64_t signalPtr, int tid) {
++  if (signalPtr == 0 || tid != 0) return;
++  ncclFluxAgSignalDev* signal = reinterpret_cast<ncclFluxAgSignalDev*>(signalPtr);
++  if (signal->launchSignal != nullptr) fluxAgStoreRelease(signal->launchSignal, 1);
++}
++
++__device__ __forceinline__ void fluxAgSignalRankReady(uint64_t signalPtr, int tid, int rankDest) {
++  if (signalPtr == 0 || tid != 0) return;
++  ncclFluxAgSignalDev* signal = reinterpret_cast<ncclFluxAgSignalDev*>(signalPtr);
++  int split = signal->split <= 0 ? 1 : signal->split;
++  if (split != 1 || signal->barrier == nullptr) return;
++  fluxAgStoreRelease(signal->barrier + rankDest, 1);
++}
++
+ template <typename T, typename RedOp, typename Proto, bool isNetOffload = false>
+ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+   ncclRing* ring = &ncclShmem.channel.ring;
+@@ -24,6 +54,7 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
+   int workNthreads;
+   T* inputBuf = (T*)work->sendbuff;
+   T* outputBuf = (T*)work->recvbuff;
++  fluxAgSignalLaunch(work->fluxAgSignal, tid);
+ 
+   // If isNetOffload == true, we only use 1 warp to drive Ring algo/network communication
+   // and the rest of warps proceed to copy src data into dst buffer in parallel when AG
+@@ -58,12 +89,14 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
+       } else {
+         prims.directCopySend(dataOffset, offset, nelem);
+       }
++      if (!isNetOffload && elemOffset + chunkCount >= partCount) fluxAgSignalRankReady(work->fluxAgSignal, tid, rankDest);
+ 
+       // k-2 steps: copy to next GPU
+       for (int j = 1; j < nranks - 1; ++j) {
+         rankDest = ringRanks[nranks - j];
+         offset = dataOffset + rankDest * count;
+         prims.directRecvCopyDirectSend(offset, offset, nelem);
++        if (elemOffset + chunkCount >= partCount) fluxAgSignalRankReady(work->fluxAgSignal, tid, rankDest);
+       }
+ 
+       // Make final copy from buffer to dest.
+@@ -72,6 +105,7 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
+ 
+       // Final wait/copy.
+       prims.directRecv(offset, nelem);
++      if (elemOffset + chunkCount >= partCount) fluxAgSignalRankReady(work->fluxAgSignal, tid, rankDest);
+     }
+   } else if (inputBuf != outputBuf + ringRanks[0] * count) {
+     inputBuf = inputBuf + partOffset;
+@@ -84,7 +118,10 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
+   // otherwise, we can have contention if next work will use the outputBuf
+   // in this work. We use bar 14 to avoid conflicts with prims barrier and
+   // __syncthread().
+-  if (isNetOffload) barrier_sync(14, nthreads);
++  if (isNetOffload) {
++    barrier_sync(14, nthreads);
++    fluxAgSignalRankReady(work->fluxAgSignal, tid, ringRanks[0]);
++  }
+ }
+ } // namespace
+ 
+diff --git a/src/enqueue.cc b/src/enqueue.cc
+index 9f59b21..947b98e 100644
+--- a/src/enqueue.cc
++++ b/src/enqueue.cc
+@@ -327,6 +327,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
+     devWork.nWarps = task->nWarps;
+     devWork.redOpArg = task->opDev.scalarArg;
+     devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
++    devWork.fluxAgSignal = task->fluxAgSignal;
+     devWork.oneNode = (comm->nNodes == 1);
+     devWork.isOneRPN = comm->isOneRPN;
+     devWork.netRegUsed = devWork.regUsed = 0;
+@@ -432,13 +433,20 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
+       struct ncclTaskColl* aggEnd = aggBeg->next;
+       struct ncclTaskColl agg = *aggBeg;
+       // We aggregate operations that are within 4X size of each other.
+-      while (aggEnd != nullptr && aggEnd->trafficBytes < 4 * aggBeg->trafficBytes) {
++      while (aggBeg->fluxAgSignal == 0 && aggEnd != nullptr && aggEnd->fluxAgSignal == 0 &&
++             aggEnd->trafficBytes < 4 * aggBeg->trafficBytes) {
+         agg.count += aggEnd->count;
+         agg.trafficBytes += aggEnd->trafficBytes;
+         aggEnd = aggEnd->next;
+       }
+ 
+       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
++      if (agg.fluxAgSignal != 0) {
++        agg.algorithm = NCCL_ALGO_RING;
++        agg.protocol = NCCL_PROTO_SIMPLE;
++        agg.nMaxChannels = 1;
++        agg.nWarps = std::max(3, comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] / WARP_SIZE);
++      }
+       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
+ 
+       int isCollnet = 0, isNvls = 0;
+@@ -517,6 +525,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
+       devWork.nWarps = task->nWarps;
+       devWork.redOpArg = task->opDev.scalarArg;
+       devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
++      devWork.fluxAgSignal = task->fluxAgSignal;
+       devWork.oneNode = (comm->nNodes == 1);
+       devWork.netRegUsed = devWork.regUsed = 0;
+       devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
+@@ -2740,6 +2749,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
+     t->opDev = opDev; // C++ struct assignment
+     t->chunkSteps = info->chunkSteps;
+     t->sliceSteps = info->sliceSteps;
++    t->fluxAgSignal = info->fluxAgSignal;
+     t->eActivationMask = ncclProfilerApiState.eActivationMask;
+     t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
+     t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;
+diff --git a/src/include/comm.h b/src/include/comm.h
+index 1be4757..ce620ad 100644
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -201,6 +201,7 @@ struct ncclTaskColl {
+   ncclRedOp_t opHost;
+   struct ncclDevRedOpFull opDev;
+   int chunkSteps, sliceSteps;
++  uint64_t fluxAgSignal;
+   // Computed later:
+   size_t trafficBytes;
+   int32_t nMaxChannels:8;
+diff --git a/src/include/device.h b/src/include/device.h
+index 71ddd85..7a224ac 100644
+--- a/src/include/device.h
++++ b/src/include/device.h
+@@ -312,7 +312,7 @@ struct alignas(16) ncclDevWorkColl {
+     } collnet;
+   };
+   uint64_t redOpArg;
+-  uint8_t pad2[8];   // pad struct to multiple of 16
++  uint64_t fluxAgSignal;
+ };
+ 
+ struct alignas(16) ncclDevWorkBcast {
+diff --git a/src/include/info.h b/src/include/info.h
+index da54515..a1a41fb 100644
+--- a/src/include/info.h
++++ b/src/include/info.h
+@@ -38,6 +38,8 @@ struct ncclInfo {
+   // WaitSignal descriptors
+   int nDesc;
+   ncclWaitSignalDesc_t* signalDescs;
++  // Flux AG-GEMM signal config, device pointer to ncclFluxAgSignal_t.
++  uint64_t fluxAgSignal;
+ };
+ 
+ #endif
+diff --git a/src/nccl.h.in b/src/nccl.h.in
+index 471389d..326aa1a 100644
+--- a/src/nccl.h.in
++++ b/src/nccl.h.in
+@@ -531,6 +531,27 @@ ncclResult_t  ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcou
+ ncclResult_t pncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcount,
+     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
+ 
++typedef struct ncclFluxAgSignal {
++  int* barrier;      /* Device pointer: Flux AG-GEMM barrier buffer. */
++  int* counters;     /* Reserved device pointer for split/chunk completion counters. */
++  int* launchSignal; /* Optional device pointer signaled when the NCCL kernel starts. */
++  int split;         /* First implementation supports split == 1. */
++} ncclFluxAgSignal_t;
++
++/*
++ * Flux-specific All-Gather variant.
++ *
++ * This experimental extension gathers like ncclAllGather and lets NCCL signal
++ * Flux barrier buffers when receive blocks become available to the local GPU.
++ *
++ * `signal` must be a device-accessible pointer to ncclFluxAgSignal_t, and all
++ * pointer fields inside it must also be device pointers visible to this rank.
++ */
++ncclResult_t  ncclAllGatherFluxSignal(const void* sendbuff, void* recvbuff, size_t sendcount,
++    ncclDataType_t datatype, const ncclFluxAgSignal_t* signal, ncclComm_t comm, cudaStream_t stream);
++ncclResult_t pncclAllGatherFluxSignal(const void* sendbuff, void* recvbuff, size_t sendcount,
++    ncclDataType_t datatype, const ncclFluxAgSignal_t* signal, ncclComm_t comm, cudaStream_t stream);
++
+ /*
+  * All-to-All
+  *
