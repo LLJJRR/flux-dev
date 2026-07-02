@@ -17,6 +17,7 @@
 
 #include "ag_gemm/ths_op/all_gather_gemm_op.h"
 
+#include "ag_gemm/ths_op/nccl_signal_all_gather.h"
 #include "coll/ths_op/all_gather_types.h"
 #include "coll/ths_op/all_gather_op.h"
 #include "flux/args/ag_gemm.h"
@@ -50,6 +51,7 @@
 #include <torch/all.h>
 
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <variant>
 
@@ -83,6 +85,16 @@ inline bool
 gwb_event_profile_enabled_for_flush() {
   return std::getenv("FLUX_GWB_EVENT_PROFILE") != nullptr ||
          std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr;
+}
+
+inline bool
+ag_nccl_signal_enabled() {
+  return std::getenv("FLUX_AG_USE_NCCL_SIGNAL") != nullptr;
+}
+
+inline bool
+ag_nccl_signal_wait_enabled() {
+  return std::getenv("FLUX_AG_NCCL_SIGNAL_WAIT") != nullptr;
 }
 
 inline void
@@ -204,6 +216,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
 
   GemmWithBarirer gemm_op;
   AllGatherOp ag_op;
+  std::unique_ptr<NcclSignalAllGather> nccl_signal_ag;
 
   bool use_pdl;  // sm90 feature
 
@@ -363,7 +376,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> gathered_input,
       c10::optional<UnifiedGemmHParams> const &hparams,
       cudaStream_t stream) {
-    if (use_pdl && opt.use_cuda_core_ag) {
+    if (!ag_nccl_signal_enabled() && use_pdl && opt.use_cuda_core_ag) {
       return forward_with_pdl_impl(
           input,
           weight,
@@ -447,6 +460,9 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     int M = input.size(0) * this->world_size;
     torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
     bool is_s8_gemm = is_s8_torch_dtype(input.scalar_type());
+    bool use_nccl_signal = ag_nccl_signal_enabled();
+    FLUX_CHECK(!use_nccl_signal || !is_s8_gemm)
+        << "FLUX_AG_USE_NCCL_SIGNAL does not support S8 input-scale all-gather yet";
     at::optional<torch::Tensor> input_scale_tensor =
         is_s8_gemm
             ? (input_scale.has_value()
@@ -462,7 +478,25 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_record(cp_ag_start, this->cp_stream);
     }
 
-    ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+    if (use_nccl_signal) {
+      if (this->nccl_signal_ag == nullptr) {
+        this->nccl_signal_ag = std::make_unique<NcclSignalAllGather>(this->tp_group);
+      }
+
+      CUDA_CHECK(cudaMemsetAsync(barrier.data_ptr(), 0, barrier.nbytes(), stream));
+      CUDA_CHECK(cudaEventRecord(this->ready_event, stream));
+      CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream, this->ready_event));
+
+      this->nccl_signal_ag->run(
+          input.data_ptr(),
+          input_buffer.data_ptr(),
+          barrier.data_ptr(),
+          input.nbytes(),
+          this->cp_stream);
+      CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream));
+    } else {
+      ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+    }
 
     if (prof) {
       agk_event_record(cp_ag_stop, this->cp_stream);
@@ -472,7 +506,11 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_record(wait_local_start, stream);
     }
 
-    CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+    if (!use_nccl_signal) {
+      CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+    } else if (ag_nccl_signal_wait_enabled()) {
+      CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
+    }
 
     if (prof) {
       agk_event_record(wait_local_stop, stream);
