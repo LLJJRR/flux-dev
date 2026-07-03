@@ -16,6 +16,7 @@ else()
 endif()
 target_link_libraries(flux_cuda_ths_op
     flux_cuda
+    nccl_static
     ${TORCH_LIBRARIES} ${TRITON_AOT_LIB})
 
 # Write the unchached variable to a file

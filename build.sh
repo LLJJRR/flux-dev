@@ -229,11 +229,11 @@ function build_flux_py {
     fi
     popd
     ##### build flux torch bindings #####
-    PY_DEVELOP_ARGS=(develop)
+    PIP_INSTALL_ARGS=(install -e . --no-build-isolation)
     if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-        PY_DEVELOP_ARGS+=(--user)
+        PIP_INSTALL_ARGS+=(--user)
     fi
-    MAX_JOBS=${JOBS} python3 setup.py "${PY_DEVELOP_ARGS[@]}"
+    MAX_JOBS=${JOBS} python3 -m pip "${PIP_INSTALL_ARGS[@]}"
     if [ $BDIST_WHEEL == "ON" ]; then
         MAX_JOBS=${JOBS} python3 setup.py bdist_wheel
     fi

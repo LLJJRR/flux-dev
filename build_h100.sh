@@ -61,28 +61,7 @@ ${NVSHMEM_HOME}/lib:\
 /usr/local/cuda/lib64:\
 ${LD_LIBRARY_PATH}
 
-########################################
-# CLEAN
-########################################
-
-rm -rf build
-rm -rf build/lib.*
-rm -f python/flux_ths_pybind*.so
-
-########################################
-# BUILD
-########################################
-
-./build.sh \
-    --arch 90 \
-    --sm-cores 132 \
-    --nvshmem \
-    --jobs ${JOBS}
-
-########################################
-# ENV SCRIPT
-########################################
-
+function write_flux_env_script() {
 cat >/root/flux_env.sh <<EOF
 source ${VENV_DIR}/bin/activate
 
@@ -109,6 +88,33 @@ export FLUX_SHM_USE_NVSHMEM=1
 # export NCCL_NVLS_ENABLE=0
 # export NCCL_COLLNET_ENABLE=0
 EOF
+}
+
+write_flux_env_script
+
+########################################
+# CLEAN
+########################################
+
+rm -rf build
+rm -rf build/lib.*
+rm -f python/flux_ths_pybind*.so
+
+########################################
+# BUILD
+########################################
+
+./build.sh \
+    --arch 90 \
+    --sm-cores 132 \
+    --nvshmem \
+    --jobs ${JOBS}
+
+########################################
+# ENV SCRIPT
+########################################
+
+write_flux_env_script
 
 ########################################
 # VERIFY
