@@ -69,6 +69,7 @@ export NCCL_ROOT=${NCCL_ROOT}
 
 export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
+export LD_PRELOAD=/usr/local/cuda/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}
 export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
 
 export FLUX_SHM_USE_NVSHMEM=1
