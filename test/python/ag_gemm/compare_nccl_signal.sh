@@ -15,6 +15,14 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 
 mkdir -p "${LOG_DIR}"
 
+GPU_COUNT=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
+if [[ "${GPU_COUNT}" -lt 2 && "${FLUX_COMPARE_ALLOW_SINGLE_GPU:-0}" != "1" ]]; then
+  echo "compare_nccl_signal.sh needs at least 2 visible GPUs for AG-GEMM comparison."
+  echo "Currently visible GPUs: ${GPU_COUNT}."
+  echo "Expose more GPUs, or set FLUX_COMPARE_ALLOW_SINGLE_GPU=1 for a single-rank smoke test."
+  exit 1
+fi
+
 COMMON_ARGS=(
   "${FLUX_COMPARE_TEST:-test/python/ag_gemm/test_ag_kernel.py}"
   "${M}" "${N}" "${K}"

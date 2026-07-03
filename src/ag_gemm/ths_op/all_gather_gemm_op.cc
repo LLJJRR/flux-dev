@@ -460,7 +460,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     int M = input.size(0) * this->world_size;
     torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
     bool is_s8_gemm = is_s8_torch_dtype(input.scalar_type());
-    bool use_nccl_signal = ag_nccl_signal_enabled();
+    bool use_nccl_signal = ag_nccl_signal_enabled() && this->world_size > 1;
     FLUX_CHECK(!use_nccl_signal || !is_s8_gemm)
         << "FLUX_AG_USE_NCCL_SIGNAL does not support S8 input-scale all-gather yet";
     at::optional<torch::Tensor> input_scale_tensor =
