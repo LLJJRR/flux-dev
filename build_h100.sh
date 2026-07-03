@@ -56,7 +56,6 @@ export NCCL_ROOT=${FLUX_DIR}/3rdparty/nccl/build/local
 export FLUX_SHM_USE_NVSHMEM=1
 
 export LD_LIBRARY_PATH=\
-${NCCL_ROOT}/lib:\
 ${NVSHMEM_HOME}/lib:\
 /usr/local/cuda/lib64:\
 ${LD_LIBRARY_PATH}
@@ -70,7 +69,7 @@ export NCCL_ROOT=${NCCL_ROOT}
 
 export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
-export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NCCL_ROOT}/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
 
 export FLUX_SHM_USE_NVSHMEM=1
 
