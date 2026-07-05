@@ -219,6 +219,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
   std::unique_ptr<NcclSignalAllGather> nccl_signal_ag;
 
   bool use_pdl;  // sm90 feature
+  bool disable_nccl_signal_for_profiling = false;
 
  private:
   AllGatherOption
@@ -460,7 +461,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     int M = input.size(0) * this->world_size;
     torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
     bool is_s8_gemm = is_s8_torch_dtype(input.scalar_type());
-    bool use_nccl_signal = ag_nccl_signal_enabled() && this->world_size > 1;
+    bool use_nccl_signal =
+        ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
     FLUX_CHECK(!use_nccl_signal || !is_s8_gemm)
         << "FLUX_AG_USE_NCCL_SIGNAL does not support S8 input-scale all-gather yet";
     at::optional<torch::Tensor> input_scale_tensor =
@@ -715,6 +717,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     auto elapsed_tensor = torch::empty({}, weight.options().dtype(c10::ScalarType::Float));
     auto reduced_elapsed_tensor = elapsed_tensor.clone();
 
+    const bool restore_disable_nccl_signal_for_profiling = this->disable_nccl_signal_for_profiling;
+    this->disable_nccl_signal_for_profiling = true;
     OpRegistry::instance().visit_hparams(
         [&](UnifiedGemmHParams const &hparams) {
           if (not filter_hparams(hparams)) {
@@ -769,6 +773,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           ctx->add(meta, rt_config, hparams, reduce_elapsed);
         },
         meta);
+    this->disable_nccl_signal_for_profiling = restore_disable_nccl_signal_for_profiling;
 
     auto best_hparams = ctx->record_best(meta, rt_config);
 
