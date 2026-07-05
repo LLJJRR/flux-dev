@@ -23,7 +23,7 @@ if [[ "${GPU_COUNT}" -lt 2 && "${FLUX_COMPARE_ALLOW_SINGLE_GPU:-0}" != "1" ]]; t
   exit 1
 fi
 
-COMMON_ARGS=(
+BASE_ARGS=(
   "${FLUX_COMPARE_TEST:-test/python/ag_gemm/test_ag_kernel.py}"
   "${M}" "${N}" "${K}"
   "--dtype=${DTYPE}"
@@ -31,15 +31,27 @@ COMMON_ARGS=(
   "--iters=${ITERS}"
 )
 
+BASELINE_ARGS=("${BASE_ARGS[@]}")
+SIGNAL_ARGS=("${BASE_ARGS[@]}")
+
 if [[ -n "${FLUX_COMPARE_EXTRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   EXTRA_ARGS=(${FLUX_COMPARE_EXTRA_ARGS})
-  COMMON_ARGS+=("${EXTRA_ARGS[@]}")
+  for arg in "${EXTRA_ARGS[@]}"; do
+    BASELINE_ARGS+=("${arg}")
+    if [[ "${arg}" == "--tune-agk" ]]; then
+      echo "Note: --tune-agk is used for baseline_flux only; NCCL-signal cases skip profiling."
+    else
+      SIGNAL_ARGS+=("${arg}")
+    fi
+  done
 fi
 
 run_case() {
   local name=$1
-  shift
+  local args_name=$2
+  shift 2
+  local -n case_args="${args_name}"
   local log_file="${LOG_DIR}/${name}.log"
 
   echo
@@ -47,16 +59,16 @@ run_case() {
   echo "log: ${log_file}"
   (
     cd "${FLUX_DIR}"
-    "$@" ./launch.sh "${COMMON_ARGS[@]}"
+    "$@" ./launch.sh "${case_args[@]}"
   ) 2>&1 | tee "${log_file}"
 }
 
 export CUDA_VISIBLE_DEVICES
 
-run_case "baseline_flux" \
+run_case "baseline_flux" BASELINE_ARGS \
   env -u FLUX_AG_USE_NCCL_SIGNAL -u FLUX_AG_NCCL_SIGNAL_WAIT
 
-run_case "nccl_signal_wait" \
+run_case "nccl_signal_wait" SIGNAL_ARGS \
   env \
     FLUX_AG_USE_NCCL_SIGNAL=1 \
     FLUX_AG_NCCL_SIGNAL_WAIT=1 \
@@ -66,7 +78,7 @@ run_case "nccl_signal_wait" \
     NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}" \
     NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
 
-run_case "nccl_signal_fused" \
+run_case "nccl_signal_fused" SIGNAL_ARGS \
   env -u FLUX_AG_NCCL_SIGNAL_WAIT \
     FLUX_AG_USE_NCCL_SIGNAL=1 \
     NCCL_ALGO="${NCCL_ALGO:-Ring}" \
