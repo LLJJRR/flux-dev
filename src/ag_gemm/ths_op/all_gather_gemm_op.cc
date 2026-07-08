@@ -113,7 +113,7 @@ ag_nccl_debug(int rank, const char *message) {
 }
 
 inline void
-set_ag_barrier_ready_async(torch::Tensor const &barrier, int world_size) {
+set_ag_barrier_ready_async(torch::Tensor &barrier, int world_size) {
   int nsignals = world_size * ::bytedance::flux::kAGGemmSplit;
   FLUX_CHECK_GE(barrier.numel(), nsignals);
   barrier.fill_(1);
@@ -487,7 +487,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
     if (use_nccl_signal) {
       ag_nccl_debug(
-          this->rank,
+          rank,
           ag_nccl_signal_wait_enabled() ? "forward use NCCL wait path"
                                         : "forward use NCCL fused signal path");
     }
@@ -510,18 +510,18 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
 
     if (use_nccl_signal) {
       if (this->nccl_signal_ag == nullptr) {
-        ag_nccl_debug(this->rank, "create NcclSignalAllGather begin");
+        ag_nccl_debug(rank, "create NcclSignalAllGather begin");
         this->nccl_signal_ag = std::make_unique<NcclSignalAllGather>(this->tp_group);
-        ag_nccl_debug(this->rank, "create NcclSignalAllGather end");
+        ag_nccl_debug(rank, "create NcclSignalAllGather end");
       }
 
-      ag_nccl_debug(this->rank, "barrier memset begin");
+      ag_nccl_debug(rank, "barrier memset begin");
       CUDA_CHECK(cudaMemsetAsync(barrier.data_ptr(), 0, barrier.nbytes(), stream));
       CUDA_CHECK(cudaEventRecord(this->ready_event, stream));
       CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream, this->ready_event));
-      ag_nccl_debug(this->rank, "barrier memset enqueued");
+      ag_nccl_debug(rank, "barrier memset enqueued");
 
-      ag_nccl_debug(this->rank, "nccl allgather run begin");
+      ag_nccl_debug(rank, "nccl allgather run begin");
       this->nccl_signal_ag->run(
           input.data_ptr(),
           input_buffer.data_ptr(),
@@ -529,9 +529,9 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           input.nbytes(),
           this->cp_stream,
           !ag_nccl_signal_wait_enabled());
-      ag_nccl_debug(this->rank, "nccl allgather run end");
+      ag_nccl_debug(rank, "nccl allgather run end");
       CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream));
-      ag_nccl_debug(this->rank, "all_gather_event recorded");
+      ag_nccl_debug(rank, "all_gather_event recorded");
     } else {
       ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
     }
@@ -547,12 +547,12 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     if (!use_nccl_signal) {
       CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
     } else if (ag_nccl_signal_wait_enabled()) {
-      ag_nccl_debug(this->rank, "wait all_gather_event begin");
+      ag_nccl_debug(rank, "wait all_gather_event begin");
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
-      ag_nccl_debug(this->rank, "wait all_gather_event enqueued");
-      ag_nccl_debug(this->rank, "set barrier ready begin");
+      ag_nccl_debug(rank, "wait all_gather_event enqueued");
+      ag_nccl_debug(rank, "set barrier ready begin");
       set_ag_barrier_ready_async(barrier, this->world_size);
-      ag_nccl_debug(this->rank, "set barrier ready end");
+      ag_nccl_debug(rank, "set barrier ready end");
     }
 
     if (prof) {
@@ -566,7 +566,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     }
 
     if (use_nccl_signal) {
-      ag_nccl_debug(this->rank, "gemm_op.forward begin");
+      ag_nccl_debug(rank, "gemm_op.forward begin");
     }
     result = this->gemm_op.forward(
         input_buffer,
@@ -583,7 +583,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
         stream);
     if (use_nccl_signal) {
-      ag_nccl_debug(this->rank, "gemm_op.forward end");
+      ag_nccl_debug(rank, "gemm_op.forward end");
     }
 
     if (prof) {
