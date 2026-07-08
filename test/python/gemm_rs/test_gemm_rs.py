@@ -170,6 +170,7 @@ def perf_flux(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     reduce_scatter_option: flux.ReduceScatterOption = flux.ReduceScatterOption(),
+    tune_gemm_rs: bool = False,
 ):
     is_fp8 = flux.util.is_fp8_dtype(input.dtype)
     is_s8_dequant = input.dtype == torch.int8
@@ -202,6 +203,42 @@ def perf_flux(
         fuse_reduction=fuse_reduction,
         ring_reduction=ring_reduction,
     )
+
+    if tune_gemm_rs:
+        torch.distributed.barrier()
+        torch.cuda.current_stream().synchronize()
+
+        if TP_GROUP.rank() == 0:
+            print(
+                "[GEMM-RS TUNE] start GemmRS profiling "
+                f"M={M}, N={N}, K={input.size(1) * TP_GROUP.size()}, "
+                f"local_K={input.size(1)}, dtype={input.dtype}, "
+                f"transpose_weight={transpose_weight}, "
+                f"fuse_reduction={fuse_reduction}, "
+                f"ring_reduction={ring_reduction}, "
+                f"reduce_scatter_option={reduce_scatter_option}"
+            )
+
+        prof_ctx = flux.ProfilingContext(
+            f"gemm_rs_tune_M{M}_N{N}_K{input.size(1) * TP_GROUP.size()}"
+        )
+        _ = gemm_rs_op.profiling(
+            input,
+            w,
+            bias=bias,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=False,
+            prof_ctx=prof_ctx,
+            reduce_scatter_option=reduce_scatter_option,
+        )
+
+        torch.cuda.current_stream().synchronize()
+        torch.distributed.barrier()
+
+        if TP_GROUP.rank() == 0:
+            print("[GEMM-RS TUNE] finish GemmRS profiling")
 
     warmup_iters = warmup
     total_iters = warmup_iters + iters
@@ -382,6 +419,12 @@ def parse_args():
         "--profile", default=False, action="store_true", help="dump torch.profiler.profile"
     )
     parser.add_argument(
+        "--tune-gemm-rs",
+        default=False,
+        action="store_true",
+        help="run GemmRS hparams profiling before benchmark",
+    )
+    parser.add_argument(
         "--transpose_weight", default=False, action="store_true", help="whether to transpose weight"
     )
     parser.add_argument(
@@ -539,6 +582,7 @@ if __name__ == "__main__":
             input_scale,
             weight_scale,
             reduce_scatter_option=reduce_scatter_option,
+            tune_gemm_rs=args.tune_gemm_rs,
         )
         perf_res_torch = perf_torch(
             input,
