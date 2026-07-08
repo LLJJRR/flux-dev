@@ -465,6 +465,7 @@ def perf_flux(
             gathered_input=full_input if gather_input else None,
             prof_ctx=prof_ctx,
         )
+        flux.load_tuning_record(prof_ctx.get_latest_record())
 
         torch.cuda.current_stream().synchronize()
         torch.distributed.barrier()

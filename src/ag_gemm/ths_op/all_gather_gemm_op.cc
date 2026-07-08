@@ -773,8 +773,6 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           ctx->add(meta, rt_config, hparams, reduce_elapsed);
         },
         meta);
-    this->disable_nccl_signal_for_profiling = restore_disable_nccl_signal_for_profiling;
-
     auto best_hparams = ctx->record_best(meta, rt_config);
 
     if (this->tp_group->get_rank() == 0) {
@@ -786,7 +784,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
                 << std::endl;
     }
 
-    return this->forward_impl(
+    auto result = this->forward_impl(
         std::move(input),
         std::move(weight),
         std::move(bias),
@@ -800,6 +798,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         std::move(gathered_input),
         std::move(best_hparams),
         stream);
+    this->disable_nccl_signal_for_profiling = restore_disable_nccl_signal_for_profiling;
+    return result;
   }
 };
 

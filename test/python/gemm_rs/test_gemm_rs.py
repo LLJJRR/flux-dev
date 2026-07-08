@@ -233,6 +233,7 @@ def perf_flux(
             prof_ctx=prof_ctx,
             reduce_scatter_option=reduce_scatter_option,
         )
+        flux.load_tuning_record(prof_ctx.get_latest_record())
 
         torch.cuda.current_stream().synchronize()
         torch.distributed.barrier()
