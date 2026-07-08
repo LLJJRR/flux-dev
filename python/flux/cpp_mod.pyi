@@ -39,6 +39,12 @@ def topk_scatter_reduce(
     inputs: List[torch.Tensor], scatter_index: torch.Tensor, topk: int
 ) -> torch.Tensor: ...
 def inplace_cast_fp32_to_bf16(data: torch.Tensor) -> None: ...
+def test_nccl_signal_all_gather(
+    process_group: dist.ProcessGroup,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    emit_signal: bool = True,
+) -> None: ...
 
 class SegmentInfo:
     @property

@@ -156,6 +156,7 @@ if not isinstance(ReduceScatterOption, NotCompiled):
 # AG+GEMM
 AGKernel = _get_flux_member("AGKernel")
 AGKernelInterNode = _get_flux_member("AGKernelInterNode")
+test_nccl_signal_all_gather = _get_flux_member("test_nccl_signal_all_gather")
 
 # MOE ag-scatter
 GemmGroupedV2AGScatterOp = _get_flux_member("GemmGroupedV2AGScatterOp")

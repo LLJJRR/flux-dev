@@ -17,8 +17,14 @@
 
 #include "ag_gemm/ths_op/all_gather_gemm_op.h"
 #include "ag_gemm/ths_op/all_gather_gemm_op_internode.h"
+#include "ag_gemm/ths_op/nccl_signal_all_gather.h"
+#include "flux/cuda/cuda_common.h"
+#include "flux/flux.h"
 #include "flux/ths_op/flux_shm.h"
 #include "flux/ths_op/ths_pybind.h"
+
+#include <ATen/cuda/CUDAContext.h>
+
 namespace bytedance::flux::ths_op {
 
 using AllGatherGemmOpCls = TorchClassWrapper<AllGatherGemmOp>;
@@ -26,8 +32,50 @@ using AllGatherGemmOpInterNodeCls = TorchClassWrapper<AllGatherGemmOpInterNode>;
 
 namespace py = pybind11;
 
+void
+test_nccl_signal_all_gather(
+    c10::intrusive_ptr<c10d::ProcessGroup> pg,
+    torch::Tensor input,
+    torch::Tensor output,
+    bool emit_signal) {
+  FLUX_CHECK(input.is_cuda());
+  FLUX_CHECK(output.is_cuda());
+  FLUX_CHECK(input.is_contiguous());
+  FLUX_CHECK(output.is_contiguous());
+  FLUX_CHECK_EQ(input.scalar_type(), output.scalar_type());
+
+  auto group = std::make_shared<C10dProcessGroup>("", pg);
+  FLUX_CHECK_EQ(output.nbytes(), input.nbytes() * group->get_size());
+
+  auto barrier = torch::zeros(
+      {static_cast<int64_t>(group->get_size() * ::bytedance::flux::kAGGemmSplit)},
+      torch::TensorOptions()
+          .device(input.device())
+          .dtype(torch::kInt32));
+
+  auto stream = at::cuda::getCurrentCUDAStream(input.device().index()).stream();
+  NcclSignalAllGather nccl_signal_ag(group);
+  nccl_signal_ag.run(
+      input.data_ptr(),
+      output.data_ptr(),
+      barrier.data_ptr(),
+      input.nbytes(),
+      stream,
+      emit_signal);
+
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 static int _ [[maybe_unused]] = []() {
   ThsOpsInitRegistry::instance().register_one("all_gather_gemm_kernel", [](py::module &m) {
+    m.def(
+        "test_nccl_signal_all_gather",
+        &test_nccl_signal_all_gather,
+        py::arg("process_group"),
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("emit_signal") = true);
+
     py::class_<AllGatherGemmOpCls>(m, "AGKernel")
         .def(
             py::init([](c10::intrusive_ptr<c10d::ProcessGroup> tp_group,
