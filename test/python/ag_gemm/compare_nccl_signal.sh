@@ -66,14 +66,20 @@ run_case "nccl_signal_wait" \
     NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}" \
     NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
 
-run_case "nccl_signal_fused" \
-  env -u FLUX_AG_NCCL_SIGNAL_WAIT \
-    FLUX_AG_USE_NCCL_SIGNAL=1 \
-    NCCL_ALGO="${NCCL_ALGO:-Ring}" \
-    NCCL_PROTO="${NCCL_PROTO:-Simple}" \
-    NCCL_IBGDA_ENABLE="${NCCL_IBGDA_ENABLE:-0}" \
-    NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}" \
-    NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+if [[ "${FLUX_COMPARE_SKIP_FUSED:-0}" != "1" ]]; then
+  run_case "nccl_signal_fused" \
+    env -u FLUX_AG_NCCL_SIGNAL_WAIT \
+      FLUX_AG_USE_NCCL_SIGNAL=1 \
+      NCCL_ALGO="${NCCL_ALGO:-Ring}" \
+      NCCL_PROTO="${NCCL_PROTO:-Simple}" \
+      NCCL_IBGDA_ENABLE="${NCCL_IBGDA_ENABLE:-0}" \
+      NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}" \
+      NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+else
+  echo
+  echo "========== nccl_signal_fused =========="
+  echo "skipped because FLUX_COMPARE_SKIP_FUSED=1"
+fi
 
 echo
 echo "Logs are under ${LOG_DIR}"

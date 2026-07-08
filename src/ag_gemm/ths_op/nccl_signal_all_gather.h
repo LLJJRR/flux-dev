@@ -40,7 +40,8 @@ class NcclSignalAllGather {
       void *input_buffer,
       void *barrier_buffer,
       size_t bytes_per_rank,
-      cudaStream_t stream);
+      cudaStream_t stream,
+      bool emit_signal = true);
 
  private:
   std::shared_ptr<Group> group_;

@@ -75,11 +75,23 @@ NcclSignalAllGather::run(
     void *input_buffer,
     void *barrier_buffer,
     size_t bytes_per_rank,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool emit_signal) {
   FLUX_CHECK(input != nullptr);
   FLUX_CHECK(input_buffer != nullptr);
   FLUX_CHECK(barrier_buffer != nullptr);
   FLUX_CHECK_GT(bytes_per_rank, 0);
+
+  if (!emit_signal) {
+    NCCL_CHECK(ncclAllGather(
+        input,
+        input_buffer,
+        bytes_per_rank,
+        ncclInt8,
+        nccl_comm_,
+        stream));
+    return;
+  }
 
   ncclFluxAgSignal_t signal = {
       .barrier = static_cast<int *>(barrier_buffer),

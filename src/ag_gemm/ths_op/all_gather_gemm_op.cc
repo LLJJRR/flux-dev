@@ -22,6 +22,7 @@
 #include "coll/ths_op/all_gather_op.h"
 #include "flux/args/ag_gemm.h"
 #include "ag_gemm/ths_op/gemm_with_barrier.h"
+#include "flux/ag_gemm_split.h"
 #include "flux/cuda/cuda_common.h"
 #include "flux/flux.h"
 #include "flux/gemm_hparams.h"
@@ -95,6 +96,13 @@ ag_nccl_signal_enabled() {
 inline bool
 ag_nccl_signal_wait_enabled() {
   return std::getenv("FLUX_AG_NCCL_SIGNAL_WAIT") != nullptr;
+}
+
+inline void
+set_ag_barrier_ready_async(torch::Tensor const &barrier, int world_size) {
+  int nsignals = world_size * ::bytedance::flux::kAGGemmSplit;
+  FLUX_CHECK_GE(barrier.numel(), nsignals);
+  barrier.fill_(1);
 }
 
 inline void
@@ -494,7 +502,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           input_buffer.data_ptr(),
           barrier.data_ptr(),
           input.nbytes(),
-          this->cp_stream);
+          this->cp_stream,
+          !ag_nccl_signal_wait_enabled());
       CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream));
     } else {
       ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
@@ -512,6 +521,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
     } else if (ag_nccl_signal_wait_enabled()) {
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
+      set_ag_barrier_ready_async(barrier, this->world_size);
     }
 
     if (prof) {
