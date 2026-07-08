@@ -23,16 +23,32 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/empty.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace bytedance::flux::ths_op {
 
 namespace {
 
+bool
+nccl_signal_debug_enabled() {
+  return std::getenv("FLUX_AG_NCCL_DEBUG") != nullptr;
+}
+
+void
+nccl_signal_debug(int rank, const char *message) {
+  if (nccl_signal_debug_enabled()) {
+    std::fprintf(stderr, "[FLUX_AG_NCCL_DEBUG] rank=%d %s\n", rank, message);
+    std::fflush(stderr);
+  }
+}
+
 ncclComm_t
 create_nccl_comm_with_group(Group *group) {
   ncclComm_t comm = nullptr;
   void *host_unique_id = nullptr;
+  nccl_signal_debug(group->get_rank(), "create_nccl_comm begin");
   CUDA_CHECK(cudaMallocHost(&host_unique_id, sizeof(ncclUniqueId)));
 
   ncclUniqueId &id = *static_cast<ncclUniqueId *>(host_unique_id);
@@ -41,7 +57,9 @@ create_nccl_comm_with_group(Group *group) {
   }
 
   group->broadcast_cpu(host_unique_id, sizeof(ncclUniqueId), 0);
+  nccl_signal_debug(group->get_rank(), "ncclCommInitRank begin");
   NCCL_CHECK(ncclCommInitRank(&comm, group->get_size(), id, group->get_rank()));
+  nccl_signal_debug(group->get_rank(), "ncclCommInitRank end");
   CUDA_CHECK(cudaFreeHost(host_unique_id));
   return comm;
 }
@@ -61,11 +79,15 @@ make_signal_storage() {
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
-      signal_storage_(make_signal_storage()) {}
+      signal_storage_(make_signal_storage()) {
+  nccl_signal_debug(group_->get_rank(), "NcclSignalAllGather constructed");
+}
 
 NcclSignalAllGather::~NcclSignalAllGather() {
   if (nccl_comm_ != nullptr) {
+    nccl_signal_debug(group_->get_rank(), "ncclCommDestroy begin");
     NCCL_CHECK(ncclCommDestroy(nccl_comm_));
+    nccl_signal_debug(group_->get_rank(), "ncclCommDestroy end");
   }
 }
 
@@ -83,6 +105,7 @@ NcclSignalAllGather::run(
   FLUX_CHECK_GT(bytes_per_rank, 0);
 
   if (!emit_signal) {
+    nccl_signal_debug(group_->get_rank(), "standard ncclAllGather begin");
     NCCL_CHECK(ncclAllGather(
         input,
         input_buffer,
@@ -90,9 +113,11 @@ NcclSignalAllGather::run(
         ncclInt8,
         nccl_comm_,
         stream));
+    nccl_signal_debug(group_->get_rank(), "standard ncclAllGather end");
     return;
   }
 
+  nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
   ncclFluxAgSignal_t signal = {
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = nullptr,
@@ -106,7 +131,9 @@ NcclSignalAllGather::run(
       sizeof(signal),
       cudaMemcpyHostToDevice,
       stream));
+  nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync end");
 
+  nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal begin");
   NCCL_CHECK(ncclAllGatherFluxSignal(
       input,
       input_buffer,
@@ -115,6 +142,7 @@ NcclSignalAllGather::run(
       static_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
       nccl_comm_,
       stream));
+  nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal end");
 }
 
 }  // namespace bytedance::flux::ths_op
