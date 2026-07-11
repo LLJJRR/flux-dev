@@ -9,6 +9,7 @@ set -x
 FLUX_DIR=/root/flux
 VENV_DIR=/root/venv-flux
 JOBS=${JOBS:-16}
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 
 ########################################
 # CHECK
@@ -32,6 +33,9 @@ fi
 
 source ${VENV_DIR}/bin/activate
 
+export CUDA_HOME
+export PATH=${CUDA_HOME}/bin:$PATH
+
 export NVSHMEM_HOME=$(python - <<'PY'
 import pathlib
 import nvidia.nvshmem
@@ -41,18 +45,28 @@ PY
 
 echo "NVSHMEM_HOME=${NVSHMEM_HOME}"
 
-export TORCH_CUDART_HOME=$(python - <<'PY'
-import pathlib
-try:
-    import nvidia.cuda_runtime
-    print(pathlib.Path(nvidia.cuda_runtime.__path__[0]))
-except Exception:
-    print("")
+TORCH_CUDA_VERSION=$(python - <<'PY'
+import torch
+print(torch.version.cuda)
 PY
 )
+NVCC_CUDA_VERSION=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
 
-if [ -z "${TORCH_CUDART_HOME}" ]; then
-    echo "WARN: failed to locate nvidia.cuda_runtime; falling back to /usr/local/cuda for runtime libs"
+echo "CUDA_HOME=${CUDA_HOME}"
+echo "torch CUDA=${TORCH_CUDA_VERSION}"
+echo "nvcc CUDA=${NVCC_CUDA_VERSION}"
+
+if [ -z "${NVCC_CUDA_VERSION}" ]; then
+    echo "ERROR: failed to parse nvcc CUDA version from ${CUDA_HOME}/bin/nvcc"
+    exit 1
+fi
+
+if [ "${TORCH_CUDA_VERSION}" != "${NVCC_CUDA_VERSION}" ]; then
+    echo "ERROR: CUDA toolkit version must match PyTorch CUDA version."
+    echo "       torch reports CUDA ${TORCH_CUDA_VERSION}, but nvcc reports CUDA ${NVCC_CUDA_VERSION}."
+    echo "       Set CUDA_HOME to a CUDA ${TORCH_CUDA_VERSION} toolkit, for example:"
+    echo "       CUDA_HOME=/usr/local/cuda-${TORCH_CUDA_VERSION} ./build_h100.sh"
+    exit 1
 fi
 
 cd ${NVSHMEM_HOME}/lib
@@ -66,12 +80,13 @@ cd ${FLUX_DIR}
 
 export NVSHMEM_HOME=${NVSHMEM_HOME}
 export NCCL_ROOT=${FLUX_DIR}/3rdparty/nccl/build/local
+export CUDA_HOME=${CUDA_HOME}
 
 export FLUX_SHM_USE_NVSHMEM=1
 
 export LD_LIBRARY_PATH=\
 ${NVSHMEM_HOME}/lib:\
-/usr/local/cuda/lib64:\
+${CUDA_HOME}/lib64:\
 ${LD_LIBRARY_PATH}
 
 function write_flux_env_script() {
@@ -80,17 +95,13 @@ source ${VENV_DIR}/bin/activate
 
 export NVSHMEM_HOME=${NVSHMEM_HOME}
 export NCCL_ROOT=${NCCL_ROOT}
-export TORCH_CUDART_HOME=${TORCH_CUDART_HOME}
+export CUDA_HOME=${CUDA_HOME}
+export PATH=${CUDA_HOME}/bin:\$PATH
 
 export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
-if [ -n "\${TORCH_CUDART_HOME}" ] && [ -f "\${TORCH_CUDART_HOME}/lib/libcudart.so.12" ]; then
-    export LD_PRELOAD="\${TORCH_CUDART_HOME}/lib/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
-    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:\${TORCH_CUDART_HOME}/lib:\$LD_LIBRARY_PATH"
-else
-    export LD_PRELOAD="/usr/local/cuda/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
-    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
-fi
+export LD_PRELOAD=${CUDA_HOME}/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}
+export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:${CUDA_HOME}/lib64:\$LD_LIBRARY_PATH
 
 export FLUX_SHM_USE_NVSHMEM=1
 

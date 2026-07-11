@@ -2,8 +2,9 @@
 set -x
 set -e
 
-## Change export PATH if cuda is not at default path
-export PATH=/usr/local/cuda/bin:$PATH
+## Change CUDA_HOME if cuda is not at default path
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:$PATH
 CMAKE=${CMAKE:-cmake}
 
 ARCH=""
