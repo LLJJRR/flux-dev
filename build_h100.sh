@@ -86,7 +86,7 @@ export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
 if [ -n "\${TORCH_CUDART_HOME}" ] && [ -f "\${TORCH_CUDART_HOME}/lib/libcudart.so.12" ]; then
     export LD_PRELOAD="\${TORCH_CUDART_HOME}/lib/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
-    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:\${TORCH_CUDART_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:\${TORCH_CUDART_HOME}/lib:\$LD_LIBRARY_PATH"
 else
     export LD_PRELOAD="/usr/local/cuda/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
     export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
