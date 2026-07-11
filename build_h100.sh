@@ -128,6 +128,7 @@ write_flux_env_script
 ########################################
 
 rm -rf build
+rm -rf 3rdparty/nccl/build
 rm -rf build/lib.*
 rm -f python/flux_ths_pybind*.so
 

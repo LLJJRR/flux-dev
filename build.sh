@@ -142,9 +142,9 @@ function build_nccl() {
         for arch in "${arch_list[@]}"; do
             NCCL_COMPILE_OPTIONS_ARCH="-gencode=arch=compute_${arch},code=sm_${arch} ${NCCL_COMPILE_OPTIONS_ARCH}"
         done
-        make -j${JOBS} src.staticlib NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart NVCC_GENCODE="${NCCL_COMPILE_OPTIONS_ARCH}" VERBOSE=1
     else
-        make -j${JOBS} src.staticlib VERBOSE=1
+        make -j${JOBS} src.staticlib CUDARTLIB=cudart VERBOSE=1
     fi
     # only install static lib
     mkdir -p ${PREFIX}/lib
