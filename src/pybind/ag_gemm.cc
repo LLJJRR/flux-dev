@@ -24,6 +24,7 @@
 #include "flux/ths_op/ths_pybind.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/zeros.h>
 
 namespace bytedance::flux::ths_op {
 
@@ -47,13 +48,13 @@ test_nccl_signal_all_gather(
   auto group = std::make_shared<C10dProcessGroup>("", pg);
   FLUX_CHECK_EQ(output.nbytes(), input.nbytes() * group->get_size());
 
-  auto barrier = torch::zeros(
+  auto barrier = at::zeros(
       {static_cast<int64_t>(group->get_size() * ::bytedance::flux::kAGGemmSplit)},
-      torch::TensorOptions()
+      input.options()
           .device(input.device())
           .dtype(torch::kInt32));
 
-  auto stream = at::cuda::getCurrentCUDAStream(input.device().index()).stream();
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
   NcclSignalAllGather nccl_signal_ag(group);
   nccl_signal_ag.run(
       input.data_ptr(),
