@@ -41,6 +41,20 @@ PY
 
 echo "NVSHMEM_HOME=${NVSHMEM_HOME}"
 
+export TORCH_CUDART_HOME=$(python - <<'PY'
+import pathlib
+try:
+    import nvidia.cuda_runtime
+    print(pathlib.Path(nvidia.cuda_runtime.__path__[0]))
+except Exception:
+    print("")
+PY
+)
+
+if [ -z "${TORCH_CUDART_HOME}" ]; then
+    echo "WARN: failed to locate nvidia.cuda_runtime; falling back to /usr/local/cuda for runtime libs"
+fi
+
 cd ${NVSHMEM_HOME}/lib
 ln -sf libnvshmem_host.so.3 libnvshmem_host.so
 
@@ -66,11 +80,17 @@ source ${VENV_DIR}/bin/activate
 
 export NVSHMEM_HOME=${NVSHMEM_HOME}
 export NCCL_ROOT=${NCCL_ROOT}
+export TORCH_CUDART_HOME=${TORCH_CUDART_HOME}
 
 export PYTHONPATH=${FLUX_DIR}/python:\$PYTHONPATH
 
-export LD_PRELOAD=/usr/local/cuda/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}
-export LD_LIBRARY_PATH=${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH
+if [ -n "\${TORCH_CUDART_HOME}" ] && [ -f "\${TORCH_CUDART_HOME}/lib/libcudart.so.12" ]; then
+    export LD_PRELOAD="\${TORCH_CUDART_HOME}/lib/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
+    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:\${TORCH_CUDART_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+else
+    export LD_PRELOAD="/usr/local/cuda/lib64/libcudart.so.12\${LD_PRELOAD:+:\$LD_PRELOAD}"
+    export LD_LIBRARY_PATH="${FLUX_DIR}/python/flux/lib:${NVSHMEM_HOME}/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+fi
 
 export FLUX_SHM_USE_NVSHMEM=1
 
