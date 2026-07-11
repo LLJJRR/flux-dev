@@ -18,6 +18,7 @@
 #include "ag_gemm/ths_op/all_gather_gemm_op.h"
 #include "ag_gemm/ths_op/all_gather_gemm_op_internode.h"
 #include "ag_gemm/ths_op/nccl_signal_all_gather.h"
+#include "flux/ag_gemm_split.h"
 #include "flux/cuda/cuda_common.h"
 #include "flux/flux.h"
 #include "flux/ths_op/flux_shm.h"
@@ -25,6 +26,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/zeros.h>
+
+#include <vector>
 
 namespace bytedance::flux::ths_op {
 
@@ -48,8 +51,10 @@ test_nccl_signal_all_gather(
   auto group = std::make_shared<C10dProcessGroup>("", pg);
   FLUX_CHECK_EQ(output.nbytes(), input.nbytes() * group->get_size());
 
+  std::vector<int64_t> barrier_shape = {
+      static_cast<int64_t>(group->get_size() * ::bytedance::flux::kAGGemmSplit)};
   auto barrier = at::zeros(
-      {static_cast<int64_t>(group->get_size() * ::bytedance::flux::kAGGemmSplit)},
+      barrier_shape,
       input.options()
           .device(input.device())
           .dtype(torch::kInt32));
