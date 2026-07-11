@@ -216,6 +216,7 @@ __all__ = [
     "GemmRSInterNode",
     "AGKernel",
     "AGKernelInterNode",
+    "test_nccl_signal_all_gather",
     "AllToAllTransposeGemm",
     "All2AllOp",
     "GemmOnly",
