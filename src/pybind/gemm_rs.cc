@@ -17,16 +17,65 @@
 
 #include "flux/ths_op/flux_shm.h"
 #include "flux/ths_op/ths_pybind.h"
+#include "flux/cuda/cuda_common.h"
 #include "gemm_rs/ths_op/gemm_reduce_scatter.h"
 #include "gemm_rs/ths_op/helper_ops.h"
+#include "gemm_rs/ths_op/nccl_signal_reduce_scatter.h"
 #include "gemm_rs/tile_scheduler/threadblock_swizzle_segment_util.hpp"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/zeros.h>
+
+#include <vector>
 
 namespace bytedance::flux::ths_op {
 using GemmRSOpCls = TorchClassWrapper<GemmRS>;
 namespace py = pybind11;
 
+void
+test_nccl_signal_reduce_scatter(
+    c10::intrusive_ptr<c10d::ProcessGroup> pg,
+    torch::Tensor input,
+    torch::Tensor output,
+    bool emit_signal) {
+  FLUX_CHECK(input.is_cuda());
+  FLUX_CHECK(output.is_cuda());
+  FLUX_CHECK(input.is_contiguous());
+  FLUX_CHECK(output.is_contiguous());
+
+  auto group = std::make_shared<C10dProcessGroup>("", pg);
+  FLUX_CHECK_EQ(input.nbytes(), output.nbytes() * group->get_size());
+
+  std::vector<int64_t> barrier_shape = {static_cast<int64_t>(group->get_size())};
+  auto barrier = at::zeros(
+      barrier_shape,
+      output.options()
+          .device(output.device())
+          .dtype(torch::kInt32));
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  NcclSignalReduceScatter nccl_signal_rs(group);
+  nccl_signal_rs.run(
+      input.data_ptr(),
+      output.data_ptr(),
+      barrier.data_ptr(),
+      output.nbytes(),
+      stream,
+      emit_signal);
+
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 static int _register_gemm_rs_ops [[maybe_unused]] = []() {
   ThsOpsInitRegistry::instance().register_one("gemm_reduce_scatter", [](py::module &m) {
+    m.def(
+        "test_nccl_signal_reduce_scatter",
+        &test_nccl_signal_reduce_scatter,
+        py::arg("process_group"),
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("emit_signal") = true);
+
     py::class_<GemmRSOpCls>(m, "GemmRS")
         .def(
             py::init([](c10::intrusive_ptr<c10d::ProcessGroup> tp_group,

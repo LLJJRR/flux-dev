@@ -19,6 +19,7 @@
 import argparse
 import os
 import time
+from functools import partial
 from typing import Optional
 
 import torch
@@ -34,6 +35,60 @@ try:
     from flux.triton.gemm_rs import GemmRSTritonPCIe as GemmRSTriton
 except Exception as e:
     pass
+
+print = partial(print, flush=True)
+
+
+def benchmark_barrier() -> None:
+    torch.cuda.synchronize()
+    try:
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    except TypeError:
+        torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+
+def _option_enabled(option: flux.ReduceScatterOption, name: str) -> bool:
+    return getattr(option, name, None) is True
+
+
+def _ring_mode_name(reduce_scatter_option: flux.ReduceScatterOption) -> Optional[str]:
+    ring_mode = getattr(reduce_scatter_option, "ring_mode", None)
+    if ring_mode is None:
+        return None
+    if ring_mode == getattr(flux.RingMode, "Ring1D", object()):
+        return "ring1d"
+    if ring_mode == getattr(flux.RingMode, "Ring2D", object()):
+        return "ring2d"
+    if ring_mode == getattr(flux.RingMode, "All2All", object()):
+        return "all2all"
+    return str(ring_mode).split(".")[-1].lower()
+
+
+def flux_rs_impl_name(
+    reduce_scatter_option: flux.ReduceScatterOption, fuse_reduction: bool, ring_reduction: bool
+) -> str:
+    tags = []
+    if fuse_reduction:
+        tags.append("fuse")
+    if ring_reduction:
+        tags.append("ring_reduce")
+
+    ring_mode = _ring_mode_name(reduce_scatter_option)
+    if ring_mode is not None:
+        tags.append(ring_mode)
+    if _option_enabled(reduce_scatter_option, "use_1d_ring"):
+        tags.append("use_1d")
+    if _option_enabled(reduce_scatter_option, "use_p2p_read"):
+        tags.append("p2p_read")
+    if _option_enabled(reduce_scatter_option, "use_cudaMemcpyAsync"):
+        tags.append("cudaMemcpyAsync")
+    if _option_enabled(reduce_scatter_option, "use_gemmk"):
+        tags.append("gemmk")
+    if _option_enabled(reduce_scatter_option, "per_tile_flags"):
+        tags.append("per_tile_flags")
+
+    return "flux_rs" if not tags else "flux_rs_" + "_".join(tags)
 
 
 class PerfResult:
@@ -64,7 +119,7 @@ def perf_torch(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
 ):
-    TP_GROUP.barrier()
+    benchmark_barrier()
 
     is_fp8 = flux.util.is_fp8_dtype(input.dtype)
     is_s8_dequant = input.dtype == torch.int8
@@ -104,13 +159,35 @@ def perf_torch(
         else None
     )
 
-    total_iters = warmup_iters + iters
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    gemm_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    torch.distributed.barrier()
+    for _ in range(warmup_iters):
+        if is_fp8:
+            full_output = op.forward(
+                input,
+                w,
+                bias=bias,
+                output_buf=full_output,
+                input_scale=input_scale,
+                weight_scale=weight_scale,
+                output_scale=None,
+                fast_accum=False,
+            )
+        elif is_s8_dequant:
+            accum = matmul_int8(input, weight.t()).to(torch.float32)
+            full_output = input_scale * weight_scale * accum
+            full_output = full_output.to(output_dtype)
+        else:
+            full_output = torch.matmul(input, weight.t())
+        if bias is not None and not is_fp8:
+            if not is_s8_dequant or (is_s8_dequant and TP_GROUP.rank() == 0):
+                full_output += bias
+        torch.distributed.reduce_scatter_tensor(output, full_output, group=TP_GROUP)
 
-    for i in range(total_iters):
+    benchmark_barrier()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    gemm_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
         start_events[i].record()
         if is_fp8:
             full_output = op.forward(
@@ -139,12 +216,11 @@ def perf_torch(
 
     gemm_times = []
     comm_times = []
-    for i in range(total_iters):
+    for i in range(iters):
         gemm_end_events[i].synchronize()
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            gemm_times.append(start_events[i].elapsed_time(gemm_end_events[i]) / 1000)
-            comm_times.append(gemm_end_events[i].elapsed_time(end_events[i]) / 1000)
+        gemm_times.append(start_events[i].elapsed_time(gemm_end_events[i]) / 1000)
+        comm_times.append(gemm_end_events[i].elapsed_time(end_events[i]) / 1000)
     # print(gemm_times)
     # print(comm_times)
     gemm_time = sum(gemm_times) / iters * 1000
@@ -242,16 +318,28 @@ def perf_flux(
             print("[GEMM-RS TUNE] finish GemmRS profiling")
 
     warmup_iters = warmup
-    total_iters = warmup_iters + iters
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     with flux.util.with_torch_deterministic(False):
         gemm_only_output_buf = torch.empty(
             [M, N], dtype=output_dtype, device=input.device, requires_grad=False
         )
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        _ = gemm_only_op.forward(
+            input,
+            w,
+            bias=bias,
+            output_buf=gemm_only_output_buf,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=False,
+        )
+
+    benchmark_barrier()
+    for i in range(iters):
         start_events[i].record()
         _ = gemm_only_op.forward(
             input,
@@ -267,16 +355,28 @@ def perf_flux(
     torch.cuda.current_stream().synchronize()
 
     gemm_times = []
-    for i in range(total_iters):
+    for i in range(iters):
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
+        gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
     gemm_time = sum(gemm_times)
 
     time.sleep(1)
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        output = gemm_rs_op.forward(
+            input,
+            w,
+            bias=bias,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=False,
+            reduce_scatter_option=reduce_scatter_option,
+        )
+
+    benchmark_barrier()
+    for i in range(iters):
         start_events[i].record()
         output = gemm_rs_op.forward(
             input,
@@ -292,17 +392,16 @@ def perf_flux(
     torch.cuda.current_stream().synchronize()
 
     gemm_rs_times = []
-    for i in range(total_iters):
+    for i in range(iters):
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            gemm_rs_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
+        gemm_rs_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
     gemm_rs_time = sum(gemm_rs_times)
 
     gemm_time_ms = gemm_time / iters * 1000
     comm_time_ms = (gemm_rs_time - gemm_time) / iters * 1000
 
     return PerfResult(
-        name=f"flux  #{TP_GROUP.rank()}",
+        name=f"{flux_rs_impl_name(reduce_scatter_option, fuse_reduction, ring_reduction)} #{TP_GROUP.rank()}",
         output=output,
         gemm_time_ms=gemm_time_ms,
         comm_time_ms=comm_time_ms,
@@ -350,7 +449,6 @@ def perf_triton(
     )
 
     warmup_iters = warmup
-    total_iters = warmup_iters + iters
     start_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
     end_event: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
     with flux.util.with_torch_deterministic(False):
@@ -358,10 +456,22 @@ def perf_triton(
             [M, N], dtype=output_dtype, device=input.device, requires_grad=False
         )
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
-        if i == warmup_iters:
-            start_event.record()
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        _ = gemm_only_op.forward(
+            input,
+            w,
+            bias=bias,
+            output_buf=gemm_only_output_buf,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=False,
+        )
+
+    benchmark_barrier()
+    start_event.record()
+    for _ in range(iters):
         _ = gemm_only_op.forward(
             input,
             w,
@@ -378,10 +488,22 @@ def perf_triton(
 
     time.sleep(1)
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
-        if i == warmup_iters:
-            start_event.record()
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        output = gemm_rs_op.forward(
+            input,
+            w,
+            bias=bias,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            transpose_weight=transpose_weight,
+            fast_accum=False,
+        )
+
+    benchmark_barrier()
+    start_event.record()
+    for _ in range(iters):
         output = gemm_rs_op.forward(
             input,
             w,

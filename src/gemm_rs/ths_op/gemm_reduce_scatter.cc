@@ -45,6 +45,7 @@
 #include <c10/util/logging_is_not_google_glog.h>
 #include <c10/util/Optional.h>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -56,6 +57,23 @@
 
 namespace bytedance::flux::ths_op {
 using torch::Tensor;
+
+namespace {
+
+inline bool
+rs_debug_enabled() {
+  return std::getenv("FLUX_RS_DEBUG") != nullptr;
+}
+
+inline void
+rs_debug(int rank, const std::string &message) {
+  if (rs_debug_enabled()) {
+    std::fprintf(stderr, "[FLUX_RS_DEBUG] rank=%d %s\n", rank, message.c_str());
+    std::fflush(stderr);
+  }
+}
+
+}  // namespace
 
 std::string
 to_string(const std::optional<bool> &value) {
@@ -395,7 +413,7 @@ class GemmRS::GemmRSImpl {
       CALL_ONCE({ std::cerr << "warning: n_split option is not implemented yet." << std::endl; });
     }
 
-    return ReduceScatterOption{
+    ReduceScatterOption materialized{
         .use_barrier_queue = opt.use_barrier_queue.value_or(default_use_barrier_queue),
         .use_1d_ring = opt.use_1d_ring.value_or(default_use_1d_ring),
         .use_p2p_read = opt.use_p2p_read.value_or(default_use_p2p_read),
@@ -406,6 +424,23 @@ class GemmRS::GemmRSImpl {
         .num_blocks = opt.num_blocks.value_or(default_num_blocks),
         .ring_mode = opt.ring_mode.value_or(get_default_rs_ring_mode()),
     };
+
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "materialize opt=" << to_string(opt)
+         << " -> {use_barrier_queue=" << materialized.use_barrier_queue
+         << ", use_1d_ring=" << materialized.use_1d_ring
+         << ", use_p2p_read=" << materialized.use_p2p_read
+         << ", use_cudaMemcpyAsync=" << materialized.use_cudaMemcpyAsync
+         << ", use_gemmk=" << materialized.use_gemmk
+         << ", per_tile_flags=" << materialized.per_tile_flags
+         << ", n_split=" << materialized.n_split
+         << ", num_blocks=" << materialized.num_blocks
+         << ", ring_mode=" << static_cast<int>(materialized.ring_mode) << "}";
+      rs_debug(this->rank, os.str());
+    }
+
+    return materialized;
   }
 
  public:
@@ -457,6 +492,16 @@ class GemmRS::GemmRSImpl {
 
     this->init_output_buffer();
     CUDA_CHECK(cudaEventCreate(&event_));
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "GemmRS constructed nnodes=" << nnodes << " world_size=" << world_size
+         << " local_world_size=" << local_world_size << " local_rank=" << local_rank
+         << " no_nvlink=" << no_nvlink << " sub_world_size=" << sub_world_size
+         << " max_m=" << max_m << " n_dim=" << n_dim
+         << " transpose_weight=" << transpose_weight << " fuse_reduction=" << fuse_reduction
+         << " ring_reduction=" << ring_reduction;
+      rs_debug(this->rank, os.str());
+    }
 #if defined(FLUX_DEBUG)
     if (no_nvlink && rank == 0) {
       LOG(WARNING) << "NvLink is not supported, seems running on a PCI-e machine.";
@@ -643,6 +688,18 @@ class GemmRS::GemmRSImpl {
     UnifiedGemmHParams hparams_ =
         hparams.has_value() ? hparams.value() : OpRegistry::instance().get_hparams(meta, rt_conf);
     OpRegistry::OpPtr cutlass_op = OpRegistry::instance().get_op(meta, hparams_);
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "forward_gemm_impl begin M=" << rt_conf.m() << " N=" << rt_conf.n()
+         << " K=" << rt_conf.k() << " opt={blocks=" << opt.num_blocks
+         << ", use_barrier_queue=" << opt.use_barrier_queue
+         << ", use_1d_ring=" << opt.use_1d_ring << ", use_p2p_read=" << opt.use_p2p_read
+         << ", use_cudaMemcpyAsync=" << opt.use_cudaMemcpyAsync << ", use_gemmk=" << opt.use_gemmk
+         << ", per_tile_flags=" << opt.per_tile_flags << ", n_split=" << opt.n_split
+         << ", ring_mode=" << static_cast<int>(opt.ring_mode)
+         << "} hparams=" << debug_hparams_to_string(hparams_);
+      rs_debug(this->rank, os.str());
+    }
     ReduceScatterArguments reduce_scatter_args{
         .reduce_scatter_num_blocks = opt.num_blocks,
         .rs_stream = rs_stream_,
@@ -720,6 +777,11 @@ class GemmRS::GemmRSImpl {
     int64_t workspace_size = cutlass_op->get_workspace_size(args);
     this->lazy_init_gemm_buffer(input, workspace_size);
     void *workspace = this->gemm_buffer.defined() ? this->gemm_buffer.data_ptr() : nullptr;
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "workspace initialized bytes=" << workspace_size << " workspace=" << workspace;
+      rs_debug(this->rank, os.str());
+    }
     initialize_args_workspace(hparams_, args, workspace, stream);
 
     // initialize barrier workspace
@@ -727,12 +789,23 @@ class GemmRS::GemmRSImpl {
     // * 8 is for corner case reduce_scatter tiles. never mind this won't be a large memory
     barrier_workspace_size = barrier_workspace_size * (sizeof(PerTileFlags) / sizeof(int)) * 8;
     this->lazy_init_barrier_buffer(barrier_workspace_size);
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "barrier workspace initialized bytes=" << barrier_workspace_size
+         << " barrier=" << (this->barrier_buffer.defined() ? this->barrier_buffer.data_ptr()
+                                                           : nullptr);
+      rs_debug(this->rank, os.str());
+    }
 
     if ((fuse_reduction && !(meta.arch() == _Sm90{})) || this->no_nvlink) {
       // need to zero buffers;
+      rs_debug(this->rank, "zero buffers begin");
       zero_buffers();
+      rs_debug(this->rank, "zero buffers end");
     }
+    rs_debug(this->rank, "cutlass_op->run begin");
     cutlass_op->run(args, workspace, stream);
+    rs_debug(this->rank, "cutlass_op->run end");
 
   }  // namespace ths_op
 
@@ -774,6 +847,14 @@ class GemmRS::GemmRSImpl {
       c10::optional<UnifiedGemmHParams> hparams) {
     auto meta = get_gemm_meta(/*has_bias=*/bias.has_value());  // fast_accum doesn't matter
     auto rt_conf = get_rt_conf(input, weight, bias, input_scale, weight_scale);
+    if (rs_debug_enabled()) {
+      std::ostringstream os;
+      os << "forward_reduce_scatter_impl begin M=" << rt_conf.m() << " N=" << rt_conf.n()
+         << " K=" << rt_conf.k() << " arch=" << enum_to_string(meta.arch())
+         << " fuse_reduction=" << fuse_reduction << " no_nvlink=" << no_nvlink
+         << " nnodes=" << nnodes;
+      rs_debug(this->rank, os.str());
+    }
 
     // get cutlass op
     OpRegistry::OpPtr cutlass_op;
@@ -875,6 +956,7 @@ class GemmRS::GemmRSImpl {
       bool fast_accum,
       c10::optional<UnifiedGemmHParams> const &hparams,
       const ReduceScatterOption &opt) {
+    rs_debug(this->rank, "forward_impl begin");
     if (need_pad_m_to_TPxTile()) {
       // if need pad, decide hparams with the unpadded m before passing downwards to prevent
       // hparams of the padded m is different from the tile_size that is used for padding
@@ -898,12 +980,17 @@ class GemmRS::GemmRSImpl {
       forward_barrier(input, weight, bias);
       auto output = forward_reduce_scatter_impl(
           input, weight, bias, input_scale, weight_scale, true_hparams);
-      return output.slice(0, 0, origin_m_per_rank);
+      auto sliced = output.slice(0, 0, origin_m_per_rank);
+      rs_debug(this->rank, "forward_impl end padded");
+      return sliced;
     } else {
       forward_gemm_impl(
           input, weight, bias, input_scale, weight_scale, output_scale, fast_accum, hparams, opt);
       forward_barrier(input, weight, bias);
-      return forward_reduce_scatter_impl(input, weight, bias, input_scale, weight_scale, hparams);
+      auto output =
+          forward_reduce_scatter_impl(input, weight, bias, input_scale, weight_scale, hparams);
+      rs_debug(this->rank, "forward_impl end");
+      return output;
     }
   }
 
@@ -912,8 +999,11 @@ class GemmRS::GemmRSImpl {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     if (get_arch() == _Sm90{} and nnodes == 1) {
       // only local reduce, skip nvshmem barrier
+      rs_debug(this->rank, "forward_barrier skipped for sm90 single-node");
     } else {
+      rs_debug(this->rank, "forward_barrier begin");
       group_barrier.barrier_all(stream);
+      rs_debug(this->rank, "forward_barrier enqueued");
     }
   }
 
@@ -958,6 +1048,7 @@ class GemmRS::GemmRSImpl {
   void
   zero_buffers() {
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    rs_debug(this->rank, "zero_buffers begin");
     if (!no_nvlink) {
       if (this->output_buffer.defined()) {
         this->output_buffer.zero_();
@@ -973,6 +1064,7 @@ class GemmRS::GemmRSImpl {
     if (!no_nvlink) {
       c10::cuda::stream_synchronize(stream);
     }
+    rs_debug(this->rank, "zero_buffers end");
   }
 
   torch::Tensor

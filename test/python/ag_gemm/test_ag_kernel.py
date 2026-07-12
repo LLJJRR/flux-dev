@@ -46,6 +46,15 @@ except Exception as e:
 print = partial(print, flush=True)
 
 
+def benchmark_barrier() -> None:
+    torch.cuda.synchronize()
+    try:
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    except TypeError:
+        torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+
 def flux_ag_impl_name() -> str:
     if os.getenv("FLUX_AG_USE_NCCL_SIGNAL") != "1":
         return "flux"
@@ -136,15 +145,27 @@ def perf_torch(
         torch.distributed.all_gather_into_tensor(full_input_scale, input_scale, group=TP_GROUP)
     torch.distributed.all_gather_into_tensor(full_input, input, group=TP_GROUP)
 
-    torch.distributed.barrier()
+    benchmark_barrier()
     warmup_iters = warmup
-    total_iters = warmup_iters + iters
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+    for _ in range(warmup_iters):
+        torch.distributed.all_gather_into_tensor(full_input, input, group=TP_GROUP)
+        if is_s8_dequant:
+            accum = matmul_int8(full_input, weight.t()).to(torch.float32)
+            output = full_input_scale * weight_scale * accum
+        else:
+            output = alpha_scale * torch.matmul(full_input, weight.t())
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
+        if is_fp8 or is_s8_dequant:
+            output = output.to(torch.bfloat16)
+        if bias is not None:
+            output += bias
+
+    benchmark_barrier()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
         start_events[i].record()
         torch.distributed.all_gather_into_tensor(full_input, input, group=TP_GROUP)
         allgather_end_events[i].record()
@@ -162,12 +183,11 @@ def perf_torch(
 
     comm_times = []  # all gather
     gemm_times = []  # gemm
-    for i in range(total_iters):
+    for i in range(iters):
         allgather_end_events[i].synchronize()
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
-            gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
+        comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
+        gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
 
     comm_time = sum(comm_times) / iters * 1000
     gemm_time = sum(gemm_times) / iters * 1000
@@ -242,13 +262,26 @@ def perf_flux_no_overlap(
     )
 
     warmup_iters = warmup
-    total_iters = warmup_iters + iters
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        all_gather_into_tensor_with_fp8(full_input, input, group=TP_GROUP)
+        gemm_only_output = ag_gemm_op.gemm_only(
+            full_input,
+            w,
+            bias=bias,
+            input_scale=full_input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=fast_acc,
+            transpose_weight=transpose_weight,
+        )
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
+    benchmark_barrier()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    allgather_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    for i in range(iters):
         start_events[i].record()
         all_gather_into_tensor_with_fp8(full_input, input, group=TP_GROUP)
         allgather_end_events[i].record()
@@ -267,12 +300,11 @@ def perf_flux_no_overlap(
 
     comm_times = []  # all gather
     gemm_times = []  # gemm
-    for i in range(total_iters):
+    for i in range(iters):
         allgather_end_events[i].synchronize()
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
-            gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
+        comm_times.append(start_events[i].elapsed_time(allgather_end_events[i]) / 1000)
+        gemm_times.append(allgather_end_events[i].elapsed_time(end_events[i]) / 1000)
 
     comm_time = sum(comm_times) / iters * 1000
     gemm_time = sum(gemm_times) / iters * 1000
@@ -473,13 +505,25 @@ def perf_flux(
         if TP_GROUP.rank() == 0:
             print("[AGK TUNE] finish AGKernel profiling")
 
-    warmup_iters = warmup
-    total_iters = warmup_iters + iters if not verify else 1
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+    warmup_iters = 0 if verify else warmup
+    perf_iters = 1 if verify else iters
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(perf_iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(perf_iters)]
 
-    torch.distributed.barrier()
-    for i in range(total_iters):
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        gemm_only_output = gemm_only_op.forward(
+            full_input,
+            w,
+            bias=bias,
+            output_buf=gemm_only_output,
+            input_scale=input_scale if not is_s8_dequant else full_input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=fast_acc,
+        )
+    benchmark_barrier()
+    for i in range(perf_iters):
         start_events[i].record()
         gemm_only_output = gemm_only_op.forward(
             full_input,
@@ -495,19 +539,34 @@ def perf_flux(
     torch.cuda.current_stream().synchronize()
 
     gemm_times = []
-    for i in range(total_iters):
+    for i in range(perf_iters):
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
+        gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
     gemm_time = sum(gemm_times)
 
     full_input.zero_()
     time.sleep(1)
 
-    torch.distributed.barrier()
+    benchmark_barrier()
     ag_option.use_cuda_core_local = use_cuda_core_local
     ag_option.use_cuda_core_ag = use_cuda_core_ag
-    for i in range(total_iters):
+    for _ in range(warmup_iters):
+        all_gather_gemm_kernel.forward(
+            input,
+            w,
+            bias=bias,
+            output=ag_gemm_output,
+            input_scale=input_scale,
+            weight_scale=weight_scale,
+            output_scale=None,
+            fast_accum=fast_acc,
+            gathered_input=full_input if gather_input else None,
+            transpose_weight=transpose_weight,
+            all_gather_option=ag_option,
+        )
+
+    benchmark_barrier()
+    for i in range(perf_iters):
         start_events[i].record()
         all_gather_gemm_kernel.forward(
             input,
@@ -524,19 +583,32 @@ def perf_flux(
         )
         end_events[i].record()
 
-    torch.distributed.barrier()
-    torch.cuda.current_stream().synchronize()
+    benchmark_barrier()
 
     ag_gemm_times = []
-    for i in range(total_iters):
+    for i in range(perf_iters):
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            ag_gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
+        ag_gemm_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
 
     ag_gemm_time = sum(ag_gemm_times)
 
     ## signals are already set
-    for i in range(total_iters):
+    benchmark_barrier()
+    for _ in range(warmup_iters):
+        if not verify:
+            _ = all_gather_gemm_kernel.gemm_only(
+                full_input,
+                w,
+                bias=bias,
+                input_scale=full_input_scale,
+                weight_scale=weight_scale,
+                output_scale=None,
+                fast_accum=fast_acc,
+                transpose_weight=transpose_weight,
+            )
+
+    benchmark_barrier()
+    for i in range(perf_iters):
         start_events[i].record()
         if not verify:
             _ = all_gather_gemm_kernel.gemm_only(
@@ -551,20 +623,18 @@ def perf_flux(
             )
         end_events[i].record()
 
-    torch.distributed.barrier()
-    torch.cuda.current_stream().synchronize()
+    benchmark_barrier()
 
     gemm_only_times = []
-    for i in range(total_iters):
+    for i in range(perf_iters):
         end_events[i].synchronize()
-        if i >= warmup_iters:
-            gemm_only_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
+        gemm_only_times.append(start_events[i].elapsed_time(end_events[i]) / 1000)
     gemm_only_time = sum(gemm_only_times)
 
-    ag_gemm_time_ms = ag_gemm_time / iters * 1000
-    gemm_time_ms = gemm_time / iters * 1000
-    comm_time_ms = (ag_gemm_time - gemm_time) / iters * 1000
-    gemm_only_time_ms = gemm_only_time / iters * 1000
+    ag_gemm_time_ms = ag_gemm_time / perf_iters * 1000
+    gemm_time_ms = gemm_time / perf_iters * 1000
+    comm_time_ms = (ag_gemm_time - gemm_time) / perf_iters * 1000
+    gemm_only_time_ms = gemm_only_time / perf_iters * 1000
 
     is_bitwise_match = flux.bitwise_check(gemm_only_output, ag_gemm_output)
     if TP_GROUP.rank() == 0:
