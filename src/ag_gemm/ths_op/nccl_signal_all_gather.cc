@@ -65,9 +65,9 @@ create_nccl_comm_with_group(Group *group) {
 }
 
 torch::Tensor
-make_signal_storage() {
+make_byte_storage(size_t nbytes) {
   return torch::empty(
-      {static_cast<int64_t>(sizeof(ncclFluxAgSignal_t))},
+      {static_cast<int64_t>(nbytes)},
       torch::TensorOptions()
           .device(torch::kCUDA)
           .device_index(at::cuda::current_device())
@@ -79,7 +79,8 @@ make_signal_storage() {
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
-      signal_storage_(make_signal_storage()) {
+      signal_storage_(make_byte_storage(sizeof(ncclFluxAgSignal_t))),
+      counter_storage_(make_byte_storage(sizeof(int) * group_->get_size())) {
   nccl_signal_debug(group_->get_rank(), "NcclSignalAllGather constructed");
 }
 
@@ -117,10 +118,16 @@ NcclSignalAllGather::run(
     return;
   }
 
+  CUDA_CHECK(cudaMemsetAsync(
+      counter_storage_.data_ptr(),
+      0,
+      counter_storage_.nbytes(),
+      stream));
+
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
   ncclFluxAgSignal_t signal = {
       .barrier = static_cast<int *>(barrier_buffer),
-      .counters = nullptr,
+      .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
       .split = 1,
   };

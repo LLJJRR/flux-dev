@@ -47,6 +47,7 @@ class NcclSignalAllGather {
   std::shared_ptr<Group> group_;
   ncclComm_t nccl_comm_ = nullptr;
   torch::Tensor signal_storage_;
+  torch::Tensor counter_storage_;
 };
 
 }  // namespace bytedance::flux::ths_op
