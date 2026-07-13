@@ -358,8 +358,10 @@ AllGatherOp::AllGatherOpImpl::create_symetric_buffers() {
   }
 
   // counter buffer
-  auto options =
-      torch::TensorOptions().device(torch::Device(torch::kCUDA)).dtype(c10::ScalarType::Int);
+  auto options = torch::TensorOptions()
+                     .device(torch::Device(torch::kCUDA))
+                     .device_index(at::cuda::current_device())
+                     .dtype(c10::ScalarType::Int);
   this->counter_buffer = torch::empty({kNumSignals + 1}, options);
   this->counter_buffer.zero_();
 
