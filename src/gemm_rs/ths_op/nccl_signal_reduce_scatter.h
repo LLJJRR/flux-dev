@@ -35,11 +35,15 @@ class NcclSignalReduceScatter {
   NcclSignalReduceScatter(const NcclSignalReduceScatter &) = delete;
   NcclSignalReduceScatter &operator=(const NcclSignalReduceScatter &) = delete;
 
+  int group_size() const;
+  int rank() const;
+
   void run(
       const void *input,
       void *output,
       void *barrier_buffer,
-      size_t bytes_per_rank,
+      size_t count_per_rank,
+      ncclDataType_t datatype,
       cudaStream_t stream,
       bool emit_signal = true);
 

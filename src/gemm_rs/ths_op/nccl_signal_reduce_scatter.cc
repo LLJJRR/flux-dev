@@ -92,26 +92,37 @@ NcclSignalReduceScatter::~NcclSignalReduceScatter() {
   }
 }
 
+int
+NcclSignalReduceScatter::group_size() const {
+  return group_->get_size();
+}
+
+int
+NcclSignalReduceScatter::rank() const {
+  return group_->get_rank();
+}
+
 void
 NcclSignalReduceScatter::run(
     const void *input,
     void *output,
     void *barrier_buffer,
-    size_t bytes_per_rank,
+    size_t count_per_rank,
+    ncclDataType_t datatype,
     cudaStream_t stream,
     bool emit_signal) {
   FLUX_CHECK(input != nullptr);
   FLUX_CHECK(output != nullptr);
   FLUX_CHECK(barrier_buffer != nullptr);
-  FLUX_CHECK_GT(bytes_per_rank, 0);
+  FLUX_CHECK_GT(count_per_rank, 0);
 
   if (!emit_signal) {
     nccl_signal_debug(group_->get_rank(), "standard ncclReduceScatter begin");
     NCCL_CHECK(ncclReduceScatter(
         input,
         output,
-        bytes_per_rank,
-        ncclInt8,
+        count_per_rank,
+        datatype,
         ncclSum,
         nccl_comm_,
         stream));
@@ -145,8 +156,8 @@ NcclSignalReduceScatter::run(
   NCCL_CHECK(ncclReduceScatterFluxSignal(
       input,
       output,
-      bytes_per_rank,
-      ncclInt8,
+      count_per_rank,
+      datatype,
       ncclSum,
       static_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
       nccl_comm_,

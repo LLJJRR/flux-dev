@@ -32,6 +32,33 @@ namespace bytedance::flux::ths_op {
 using GemmRSOpCls = TorchClassWrapper<GemmRS>;
 namespace py = pybind11;
 
+namespace {
+
+ncclDataType_t
+to_nccl_dtype(torch::ScalarType dtype) {
+  switch (dtype) {
+    case torch::kFloat16:
+      return ncclFloat16;
+    case torch::kBFloat16:
+      return ncclBfloat16;
+    case torch::kFloat32:
+      return ncclFloat32;
+    case torch::kFloat64:
+      return ncclFloat64;
+    case torch::kInt8:
+      return ncclInt8;
+    case torch::kInt32:
+      return ncclInt32;
+    case torch::kInt64:
+      return ncclInt64;
+    default:
+      TORCH_CHECK(false, "unsupported dtype for NCCL reduce-scatter signal");
+  }
+  return ncclInt8;
+}
+
+}  // namespace
+
 void
 test_nccl_signal_reduce_scatter(
     c10::intrusive_ptr<c10d::ProcessGroup> pg,
@@ -42,9 +69,10 @@ test_nccl_signal_reduce_scatter(
   FLUX_CHECK(output.is_cuda());
   FLUX_CHECK(input.is_contiguous());
   FLUX_CHECK(output.is_contiguous());
+  FLUX_CHECK_EQ(input.scalar_type(), output.scalar_type());
 
   auto group = std::make_shared<C10dProcessGroup>("", pg);
-  FLUX_CHECK_EQ(input.nbytes(), output.nbytes() * group->get_size());
+  FLUX_CHECK_EQ(input.numel(), output.numel() * group->get_size());
 
   std::vector<int64_t> barrier_shape = {static_cast<int64_t>(group->get_size())};
   auto barrier = at::zeros(
@@ -59,7 +87,8 @@ test_nccl_signal_reduce_scatter(
       input.data_ptr(),
       output.data_ptr(),
       barrier.data_ptr(),
-      output.nbytes(),
+      output.numel(),
+      to_nccl_dtype(output.scalar_type()),
       stream,
       emit_signal);
 
@@ -68,6 +97,43 @@ test_nccl_signal_reduce_scatter(
 
 static int _register_gemm_rs_ops [[maybe_unused]] = []() {
   ThsOpsInitRegistry::instance().register_one("gemm_reduce_scatter", [](py::module &m) {
+    py::class_<NcclSignalReduceScatter>(m, "NcclSignalReduceScatter")
+        .def(py::init([](c10::intrusive_ptr<c10d::ProcessGroup> pg) {
+          return new NcclSignalReduceScatter(std::make_shared<C10dProcessGroup>("", pg));
+        }))
+        .def(
+            "run",
+            [](NcclSignalReduceScatter &self,
+               torch::Tensor input,
+               torch::Tensor output,
+               bool emit_signal) {
+              FLUX_CHECK(input.is_cuda());
+              FLUX_CHECK(output.is_cuda());
+              FLUX_CHECK(input.is_contiguous());
+              FLUX_CHECK(output.is_contiguous());
+              FLUX_CHECK_EQ(input.scalar_type(), output.scalar_type());
+              FLUX_CHECK_EQ(input.numel(), output.numel() * self.group_size());
+
+              std::vector<int64_t> barrier_shape = {static_cast<int64_t>(self.group_size())};
+              auto barrier = at::zeros(
+                  barrier_shape,
+                  output.options()
+                      .device(output.device())
+                      .dtype(torch::kInt32));
+              auto stream = at::cuda::getCurrentCUDAStream().stream();
+              self.run(
+                  input.data_ptr(),
+                  output.data_ptr(),
+                  barrier.data_ptr(),
+                  output.numel(),
+                  to_nccl_dtype(output.scalar_type()),
+                  stream,
+                  emit_signal);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("emit_signal") = true);
+
     m.def(
         "test_nccl_signal_reduce_scatter",
         &test_nccl_signal_reduce_scatter,
