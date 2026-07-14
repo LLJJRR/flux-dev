@@ -31,6 +31,14 @@ namespace bytedance::flux::ths_op {
 
 namespace {
 
+struct FluxNcclSignalLayout {
+  int *barrier;
+  int *counters;
+  int *launchSignal;
+  unsigned long long *readyCycles;
+  int split;
+};
+
 bool
 nccl_signal_debug_enabled() {
   return std::getenv("FLUX_RS_NCCL_DEBUG") != nullptr;
@@ -79,7 +87,7 @@ make_byte_storage(size_t nbytes) {
 NcclSignalReduceScatter::NcclSignalReduceScatter(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
-      signal_storage_(make_byte_storage(sizeof(ncclFluxAgSignal_t))),
+      signal_storage_(make_byte_storage(sizeof(FluxNcclSignalLayout))),
       counter_storage_(make_byte_storage(sizeof(int) * group_->get_size())) {
   nccl_signal_debug(group_->get_rank(), "NcclSignalReduceScatter constructed");
 }
@@ -137,7 +145,7 @@ NcclSignalReduceScatter::run(
       stream));
 
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
-  ncclFluxAgSignal_t signal = {
+  FluxNcclSignalLayout signal = {
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
@@ -160,7 +168,7 @@ NcclSignalReduceScatter::run(
       count_per_rank,
       datatype,
       ncclSum,
-      static_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
+      reinterpret_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
       nccl_comm_,
       stream));
   nccl_signal_debug(group_->get_rank(), "ncclReduceScatterFluxSignal end");

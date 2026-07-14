@@ -47,6 +47,14 @@ struct NcclSignalTimeline {
   torch::Tensor ready_cycles;
 };
 
+struct FluxNcclSignalLayout {
+  int *barrier;
+  int *counters;
+  int *launchSignal;
+  unsigned long long *readyCycles;
+  int split;
+};
+
 std::mutex nccl_signal_events_mutex;
 std::vector<NcclSignalEvent> nccl_signal_events;
 std::vector<NcclSignalTimeline> nccl_signal_timelines;
@@ -174,7 +182,7 @@ flush_nccl_signal_events_after_sync() {
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
-      signal_storage_(make_byte_storage(sizeof(ncclFluxAgSignal_t))),
+      signal_storage_(make_byte_storage(sizeof(FluxNcclSignalLayout))),
       counter_storage_(make_byte_storage(sizeof(int) * group_->get_size())) {
   nccl_signal_debug(group_->get_rank(), "NcclSignalAllGather constructed");
 }
@@ -269,7 +277,7 @@ NcclSignalAllGather::run(
   }
 
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
-  ncclFluxAgSignal_t signal = {
+  FluxNcclSignalLayout signal = {
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
@@ -302,7 +310,7 @@ NcclSignalAllGather::run(
       input_buffer,
       bytes_per_rank,
       ncclInt8,
-      static_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
+      reinterpret_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
       nccl_comm_,
       stream));
   nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal end");
