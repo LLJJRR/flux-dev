@@ -16,6 +16,7 @@
 ################################################################################
 
 import argparse
+import contextlib
 import os
 import time
 from functools import partial
@@ -61,6 +62,32 @@ def flux_ag_impl_name() -> str:
     if os.getenv("FLUX_AG_NCCL_SIGNAL_WAIT") == "1":
         return "flux_nccl_signal_wait"
     return "flux_nccl_signal_fused"
+
+
+@contextlib.contextmanager
+def ag_nccl_signal_env(enabled: bool, wait: bool = False):
+    saved = {
+        "FLUX_AG_USE_NCCL_SIGNAL": os.environ.get("FLUX_AG_USE_NCCL_SIGNAL"),
+        "FLUX_AG_NCCL_SIGNAL_WAIT": os.environ.get("FLUX_AG_NCCL_SIGNAL_WAIT"),
+    }
+
+    try:
+        if enabled:
+            os.environ["FLUX_AG_USE_NCCL_SIGNAL"] = "1"
+            if wait:
+                os.environ["FLUX_AG_NCCL_SIGNAL_WAIT"] = "1"
+            else:
+                os.environ.pop("FLUX_AG_NCCL_SIGNAL_WAIT", None)
+        else:
+            os.environ.pop("FLUX_AG_USE_NCCL_SIGNAL", None)
+            os.environ.pop("FLUX_AG_NCCL_SIGNAL_WAIT", None)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class PerfResult:
@@ -724,6 +751,12 @@ def parse_args():
         help="run with triton kernels",
     )
     parser.add_argument(
+        "--compare_nccl_signal",
+        default=False,
+        action="store_true",
+        help="run native flux and NCCL fused signal flux in the same test process",
+    )
+    parser.add_argument(
         "--gather_input",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -818,24 +851,66 @@ if __name__ == "__main__":
             args.warmup,
             args.iters,
         )
-        perf_res_flux = perf_flux(
-            input,
-            weight,
-            bias,
-            input_scale,
-            weight_scale,
-            args.transpose_weight,
-            args.gather_input,
-            RING_MODE_MAP[args.ring_mode],
-            args.warmup,
-            args.iters,
-            args.fastacc,
-            args.verify,
-            args.use_cuda_core_local,
-            args.use_cuda_core_ag,
-            args.use_pdl,
-            args.tune_agk,
-        )
+        if args.compare_nccl_signal:
+            with ag_nccl_signal_env(enabled=False):
+                perf_res_flux = perf_flux(
+                    input,
+                    weight,
+                    bias,
+                    input_scale,
+                    weight_scale,
+                    args.transpose_weight,
+                    args.gather_input,
+                    RING_MODE_MAP[args.ring_mode],
+                    args.warmup,
+                    args.iters,
+                    args.fastacc,
+                    args.verify,
+                    args.use_cuda_core_local,
+                    args.use_cuda_core_ag,
+                    args.use_pdl,
+                    args.tune_agk,
+                )
+
+            with ag_nccl_signal_env(enabled=True, wait=False):
+                perf_res_flux_nccl_fused = perf_flux(
+                    input,
+                    weight,
+                    bias,
+                    input_scale,
+                    weight_scale,
+                    args.transpose_weight,
+                    args.gather_input,
+                    RING_MODE_MAP[args.ring_mode],
+                    args.warmup,
+                    args.iters,
+                    args.fastacc,
+                    args.verify,
+                    args.use_cuda_core_local,
+                    args.use_cuda_core_ag,
+                    args.use_pdl,
+                    False,
+                )
+        else:
+            perf_res_flux = perf_flux(
+                input,
+                weight,
+                bias,
+                input_scale,
+                weight_scale,
+                args.transpose_weight,
+                args.gather_input,
+                RING_MODE_MAP[args.ring_mode],
+                args.warmup,
+                args.iters,
+                args.fastacc,
+                args.verify,
+                args.use_cuda_core_local,
+                args.use_cuda_core_ag,
+                args.use_pdl,
+                args.tune_agk,
+            )
+            perf_res_flux_nccl_fused = None
 
         perf_res_flux_no_overlap = perf_flux_no_overlap(
             input,
@@ -874,42 +949,56 @@ if __name__ == "__main__":
         if i == TP_GROUP.rank():
             log_perf(perf_res_torch)
             log_perf(perf_res_flux)
+            if perf_res_flux_nccl_fused is not None:
+                log_perf(perf_res_flux_nccl_fused)
             log_perf(perf_res_flux_no_overlap)
             if args.triton:
                 log_perf(perf_res_triton)
         torch.distributed.barrier()
 
     torch_output = perf_res_torch.output
-    flux_output = perf_res_flux.output
     torch_gathered_data = perf_res_torch.gathered_output
-    flux_gathered_data = perf_res_flux.gathered_output
-    torch.distributed.barrier()
-    if flux.bitwise_check(torch_output, flux_output):
-        print("✅  torch vs flux bitwise match")
-    else:
-        print("❌  torch vs flux not bitwise match")
-
     atol = THRESHOLD_MAP[input_dtype]
     rtol = THRESHOLD_MAP[input_dtype]
-    if args.gather_input:
+
+    flux_results = [perf_res_flux]
+    if perf_res_flux_nccl_fused is not None:
+        flux_results.append(perf_res_flux_nccl_fused)
+
+    for perf_res in flux_results:
+        flux_output = perf_res.output
+        flux_gathered_data = perf_res.gathered_output
+        torch.distributed.barrier()
+        if flux.bitwise_check(torch_output, flux_output):
+            print(f"✅  torch vs {perf_res.name.split()[0]} bitwise match")
+        else:
+            print(f"❌  torch vs {perf_res.name.split()[0]} not bitwise match")
+
+        if args.gather_input:
+            try:
+                flux.torch_allclose(flux_gathered_data, torch_gathered_data, atol=1e-9, rtol=1e-9)
+            except Exception as e:
+                torch.save(
+                    flux_gathered_data,
+                    f"{perf_res.name.split()[0]}_gathered_data_{TP_GROUP.rank()}.pt",
+                )
+                torch.save(torch_gathered_data, f"torch_gathered_data_{TP_GROUP.rank()}.pt")
+                print(f"❌ {perf_res.name.split()[0]} gathered data check failed")
+                raise e
+            else:
+                print(f"✅ {perf_res.name.split()[0]} gathered data check passed")
         try:
-            flux.torch_allclose(flux_gathered_data, torch_gathered_data, atol=1e-9, rtol=1e-9)
+            flux.torch_allclose(flux_output, torch_output, atol=atol, rtol=rtol)
         except Exception as e:
-            torch.save(flux_gathered_data, f"flux_gathered_data_{TP_GROUP.rank()}.pt")
-            torch.save(torch_gathered_data, f"torch_gathered_data_{TP_GROUP.rank()}.pt")
-            print("❌ flux gathered data check failed")
+            torch.save(flux_output, f"{perf_res.name.split()[0]}_{TP_GROUP.rank()}.pt")
+            torch.save(torch_output, f"torch_{TP_GROUP.rank()}.pt")
+            print(f"❌ {perf_res.name.split()[0]} check failed")
             raise e
         else:
-            print("✅ flux gathered data check passed")
-    try:
-        flux.torch_allclose(flux_output, torch_output, atol=atol, rtol=rtol)
-    except Exception as e:
-        torch.save(flux_output, f"flux_{TP_GROUP.rank()}.pt")
-        torch.save(torch_output, f"torch_{TP_GROUP.rank()}.pt")
-        print("❌ flux check failed")
-        raise e
-    else:
-        print("✅ flux check passed")
+            print(f"✅ {perf_res.name.split()[0]} check passed")
+
+    flux_output = perf_res_flux.output
+    flux_gathered_data = perf_res_flux.gathered_output
 
     if args.triton:
         triton_output = perf_res_triton.output
