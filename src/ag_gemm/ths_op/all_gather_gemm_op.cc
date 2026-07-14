@@ -104,6 +104,11 @@ ag_nccl_debug_enabled() {
   return std::getenv("FLUX_AG_NCCL_DEBUG") != nullptr;
 }
 
+inline bool
+ag_nccl_event_profile_enabled() {
+  return std::getenv("FLUX_AG_NCCL_EVENT_PROFILE") != nullptr;
+}
+
 inline void
 ag_nccl_debug(int rank, const char *message) {
   if (ag_nccl_debug_enabled()) {
@@ -451,6 +456,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     bool agk_prof = agk_event_profile_enabled();
     bool ag_prof = ag_event_profile_enabled_for_flush();
     bool gwb_prof = gwb_event_profile_enabled_for_flush();
+    bool nccl_event_prof = ag_nccl_event_profile_enabled();
     bool prof = agk_prof || ag_prof || gwb_prof;
 
     cudaEvent_t fwd_start{};
@@ -463,6 +469,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     cudaEvent_t gemm_stop{};
     cudaEvent_t gathered_copy_start{};
     cudaEvent_t gathered_copy_stop{};
+    cudaEvent_t nccl_barrier_memset_start{};
+    cudaEvent_t nccl_barrier_memset_stop{};
 
     if (prof) {
       agk_event_create(&fwd_start);
@@ -477,6 +485,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_create(&gathered_copy_stop);
 
       agk_event_record(fwd_start, stream);
+    }
+    if (nccl_event_prof) {
+      agk_event_create(&nccl_barrier_memset_start);
+      agk_event_create(&nccl_barrier_memset_stop);
     }
 
     torch::Tensor barrier = ag_op.local_barrier_buffer();
@@ -516,7 +528,13 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       }
 
       ag_nccl_debug(rank, "barrier memset begin");
+      if (nccl_event_prof) {
+        agk_event_record(nccl_barrier_memset_start, stream);
+      }
       CUDA_CHECK(cudaMemsetAsync(barrier.data_ptr(), 0, barrier.nbytes(), stream));
+      if (nccl_event_prof) {
+        agk_event_record(nccl_barrier_memset_stop, stream);
+      }
       CUDA_CHECK(cudaEventRecord(this->ready_event, stream));
       CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream, this->ready_event));
       ag_nccl_debug(rank, "barrier memset enqueued");
@@ -649,6 +667,20 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_destroy(gemm_stop);
       agk_event_destroy(gathered_copy_start);
       agk_event_destroy(gathered_copy_stop);
+    }
+
+    if (nccl_event_prof) {
+      if (use_nccl_signal) {
+        CUDA_CHECK(cudaEventSynchronize(nccl_barrier_memset_stop));
+        agk_event_print(
+            rank,
+            "NCCL_SIGNAL_barrier_memset",
+            nccl_barrier_memset_start,
+            nccl_barrier_memset_stop);
+      }
+      flush_nccl_signal_events_after_sync();
+      agk_event_destroy(nccl_barrier_memset_start);
+      agk_event_destroy(nccl_barrier_memset_stop);
     }
 
     return result;

@@ -50,4 +50,6 @@ class NcclSignalAllGather {
   torch::Tensor counter_storage_;
 };
 
+void flush_nccl_signal_events_after_sync();
+
 }  // namespace bytedance::flux::ths_op
