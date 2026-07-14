@@ -51,8 +51,8 @@ struct FluxNcclSignalLayout {
   int *barrier;
   int *counters;
   int *launchSignal;
-  unsigned long long *readyCycles;
   int split;
+  unsigned long long *readyCycles;
 };
 
 std::mutex nccl_signal_events_mutex;
@@ -281,10 +281,10 @@ NcclSignalAllGather::run(
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
+      .split = 1,
       .readyCycles = ag_timeline_profile_enabled()
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr())
           : nullptr,
-      .split = 1,
   };
 
   if (nccl_signal_event_profile_enabled()) {
