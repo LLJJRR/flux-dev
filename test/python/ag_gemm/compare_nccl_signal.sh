@@ -60,7 +60,6 @@ run_case "nccl_signal_wait" \
   env \
     FLUX_AG_USE_NCCL_SIGNAL=1 \
     FLUX_AG_NCCL_SIGNAL_WAIT=1 \
-    FLUX_AG_NCCL_DEBUG="${FLUX_AG_NCCL_DEBUG:-1}" \
     NCCL_ALGO="${NCCL_ALGO:-Ring}" \
     NCCL_PROTO="${NCCL_PROTO:-Simple}" \
     NCCL_IBGDA_ENABLE="${NCCL_IBGDA_ENABLE:-0}" \
@@ -71,7 +70,6 @@ if [[ "${FLUX_COMPARE_SKIP_FUSED:-0}" != "1" ]]; then
   run_case "nccl_signal_fused" \
     env -u FLUX_AG_NCCL_SIGNAL_WAIT \
       FLUX_AG_USE_NCCL_SIGNAL=1 \
-      FLUX_AG_NCCL_DEBUG="${FLUX_AG_NCCL_DEBUG:-1}" \
       NCCL_ALGO="${NCCL_ALGO:-Ring}" \
       NCCL_PROTO="${NCCL_PROTO:-Simple}" \
       NCCL_IBGDA_ENABLE="${NCCL_IBGDA_ENABLE:-0}" \

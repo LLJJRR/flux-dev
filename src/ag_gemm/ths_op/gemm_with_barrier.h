@@ -40,6 +40,8 @@ class GemmWithBarirer {
   torch::Tensor prof_wait_cycles_buffer;
   torch::Tensor prof_wait_count_buffer;
   torch::Tensor prof_tile_count_buffer;
+  torch::Tensor prof_wait_enter_cycles_buffer;
+  torch::Tensor prof_wait_exit_cycles_buffer;
 
  private:
   void lazy_init_gemm_buffer(torch::Tensor input, int64_t buffer_size);

@@ -141,6 +141,7 @@ NcclSignalReduceScatter::run(
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
+      .readyCycles = nullptr,
       .split = 1,
   };
 

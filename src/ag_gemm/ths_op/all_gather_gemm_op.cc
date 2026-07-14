@@ -109,6 +109,11 @@ ag_nccl_event_profile_enabled() {
   return std::getenv("FLUX_AG_NCCL_EVENT_PROFILE") != nullptr;
 }
 
+inline bool
+ag_timeline_profile_enabled() {
+  return std::getenv("FLUX_AG_TIMELINE_PROFILE") != nullptr;
+}
+
 inline void
 ag_nccl_debug(int rank, const char *message) {
   if (ag_nccl_debug_enabled()) {
@@ -669,18 +674,23 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_destroy(gathered_copy_stop);
     }
 
-    if (nccl_event_prof) {
+    if (nccl_event_prof || ag_timeline_profile_enabled()) {
       if (use_nccl_signal) {
-        CUDA_CHECK(cudaEventSynchronize(nccl_barrier_memset_stop));
-        agk_event_print(
-            rank,
-            "NCCL_SIGNAL_barrier_memset",
-            nccl_barrier_memset_start,
-            nccl_barrier_memset_stop);
+        CUDA_CHECK(cudaEventSynchronize(this->all_gather_event));
+        if (nccl_event_prof) {
+          CUDA_CHECK(cudaEventSynchronize(nccl_barrier_memset_stop));
+          agk_event_print(
+              rank,
+              "NCCL_SIGNAL_barrier_memset",
+              nccl_barrier_memset_start,
+              nccl_barrier_memset_stop);
+        }
       }
       flush_nccl_signal_events_after_sync();
-      agk_event_destroy(nccl_barrier_memset_start);
-      agk_event_destroy(nccl_barrier_memset_stop);
+      if (nccl_event_prof) {
+        agk_event_destroy(nccl_barrier_memset_start);
+        agk_event_destroy(nccl_barrier_memset_stop);
+      }
     }
 
     return result;

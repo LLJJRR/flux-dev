@@ -42,8 +42,14 @@ struct NcclSignalEvent {
   cudaEvent_t stop;
 };
 
+struct NcclSignalTimeline {
+  int rank;
+  torch::Tensor ready_cycles;
+};
+
 std::mutex nccl_signal_events_mutex;
 std::vector<NcclSignalEvent> nccl_signal_events;
+std::vector<NcclSignalTimeline> nccl_signal_timelines;
 
 bool
 nccl_signal_debug_enabled() {
@@ -53,6 +59,11 @@ nccl_signal_debug_enabled() {
 bool
 nccl_signal_event_profile_enabled() {
   return std::getenv("FLUX_AG_NCCL_EVENT_PROFILE") != nullptr;
+}
+
+bool
+ag_timeline_profile_enabled() {
+  return std::getenv("FLUX_AG_TIMELINE_PROFILE") != nullptr;
 }
 
 void
@@ -77,6 +88,12 @@ void
 nccl_signal_event_push(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop) {
   std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
   nccl_signal_events.push_back(NcclSignalEvent{rank, name, start, stop});
+}
+
+void
+nccl_signal_timeline_push(int rank, torch::Tensor ready_cycles) {
+  std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
+  nccl_signal_timelines.push_back(NcclSignalTimeline{rank, ready_cycles});
 }
 
 ncclComm_t
@@ -113,26 +130,44 @@ make_byte_storage(size_t nbytes) {
 
 void
 flush_nccl_signal_events_after_sync() {
-  if (!nccl_signal_event_profile_enabled()) {
+  if (!nccl_signal_event_profile_enabled() && !ag_timeline_profile_enabled()) {
     return;
   }
 
   std::vector<NcclSignalEvent> events;
+  std::vector<NcclSignalTimeline> timelines;
   {
     std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
     events.swap(nccl_signal_events);
+    timelines.swap(nccl_signal_timelines);
   }
 
-  for (auto &event : events) {
-    CUDA_CHECK(cudaEventSynchronize(event.stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));
-    std::cout << "[NCCL SIGNAL EVENT] rank=" << event.rank
-              << " name=" << event.name
-              << " ms=" << ms
-              << std::endl;
-    CUDA_CHECK(cudaEventDestroy(event.start));
-    CUDA_CHECK(cudaEventDestroy(event.stop));
+  if (nccl_signal_event_profile_enabled()) {
+    for (auto &event : events) {
+      CUDA_CHECK(cudaEventSynchronize(event.stop));
+      float ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));
+      std::cout << "[NCCL SIGNAL EVENT] rank=" << event.rank
+                << " name=" << event.name
+                << " ms=" << ms
+                << std::endl;
+      CUDA_CHECK(cudaEventDestroy(event.start));
+      CUDA_CHECK(cudaEventDestroy(event.stop));
+    }
+  }
+
+  if (ag_timeline_profile_enabled()) {
+    for (auto &timeline : timelines) {
+      auto ready_cycles_cpu = timeline.ready_cycles.cpu();
+      auto *ready_cycles = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
+      int n_data_chunks = static_cast<int>(timeline.ready_cycles.nbytes() / sizeof(uint64_t));
+      for (int i = 0; i < n_data_chunks; ++i) {
+        std::cout << "[NCCL SIGNAL TIMELINE] rank=" << timeline.rank
+                  << " chunk=" << i
+                  << " ready_globaltimer=" << ready_cycles[i]
+                  << std::endl;
+      }
+    }
   }
 }
 
@@ -218,6 +253,16 @@ NcclSignalAllGather::run(
       0,
       counter_storage_.nbytes(),
       stream));
+  if (ag_timeline_profile_enabled()) {
+    if (!ready_cycles_storage_.defined()) {
+      ready_cycles_storage_ = make_byte_storage(sizeof(uint64_t) * group_->get_size());
+    }
+    CUDA_CHECK(cudaMemsetAsync(
+        ready_cycles_storage_.data_ptr(),
+        0,
+        ready_cycles_storage_.nbytes(),
+        stream));
+  }
 
   if (nccl_signal_event_profile_enabled()) {
     nccl_signal_event_record(counter_stop, stream);
@@ -228,6 +273,9 @@ NcclSignalAllGather::run(
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
+      .readyCycles = ag_timeline_profile_enabled()
+          ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr())
+          : nullptr,
       .split = 1,
   };
 
@@ -268,6 +316,10 @@ NcclSignalAllGather::run(
         group_->get_rank(), "ncclAllGatherFluxSignal_total", allgather_start, allgather_stop);
     nccl_signal_event_push(
         group_->get_rank(), "nccl_signal_run_total", total_start, total_stop);
+  }
+
+  if (ag_timeline_profile_enabled()) {
+    nccl_signal_timeline_push(group_->get_rank(), ready_cycles_storage_);
   }
 }
 

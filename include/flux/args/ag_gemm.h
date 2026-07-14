@@ -37,6 +37,8 @@ struct AGKernelArguments {
   uint64_t *prof_wait_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
+  uint64_t *prof_wait_enter_cycles = nullptr;
+  uint64_t *prof_wait_exit_cycles = nullptr;
 };
 
 struct AGS8KernelArguments {
@@ -59,6 +61,8 @@ struct AGS8KernelArguments {
   uint64_t *prof_wait_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
+  uint64_t *prof_wait_enter_cycles = nullptr;
+  uint64_t *prof_wait_exit_cycles = nullptr;
 };
 
 struct AGFP8KernelArguments {
@@ -88,6 +92,8 @@ struct AGFP8KernelArguments {
   uint64_t *prof_wait_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
+  uint64_t *prof_wait_enter_cycles = nullptr;
+  uint64_t *prof_wait_exit_cycles = nullptr;
 };
 
 }  // namespace bytedance::flux

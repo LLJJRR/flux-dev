@@ -199,6 +199,8 @@ public:
     uint64_t *prof_wait_cycles = nullptr;
     uint32_t *prof_wait_count = nullptr;
     uint32_t *prof_tile_count = nullptr;
+    uint64_t *prof_wait_enter_cycles = nullptr;
+    uint64_t *prof_wait_exit_cycles = nullptr;
   };
 
   // Kernel entry point API
@@ -219,6 +221,8 @@ public:
     uint64_t *prof_wait_cycles = nullptr;
     uint32_t *prof_wait_count = nullptr;
     uint32_t *prof_tile_count = nullptr;
+    uint64_t *prof_wait_enter_cycles = nullptr;
+    uint64_t *prof_wait_exit_cycles = nullptr;
 
     void *workspace{nullptr};
   };
@@ -307,6 +311,8 @@ public:
         args.prof_wait_cycles,
         args.prof_wait_count,
         args.prof_tile_count,
+        args.prof_wait_enter_cycles,
+        args.prof_wait_exit_cycles,
         workspace};
   }
 
@@ -440,6 +446,28 @@ public:
       }
     };
 
+    auto record_wait_count_only = [&](int chunk_id) {
+      if (thread_idx == 0 && params.prof_wait_count != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(&params.prof_wait_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto record_wait_timeline = [&](int chunk_id, uint64_t enter_cycles, uint64_t exit_cycles) {
+      if (thread_idx == 0 && params.prof_wait_enter_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          unsigned long long old = atomicCAS(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_enter_cycles[chunk_id]),
+              0ull,
+              static_cast<unsigned long long>(enter_cycles));
+          if (old == 0ull) {
+            params.prof_wait_exit_cycles[chunk_id] = exit_cycles;
+          }
+        }
+      }
+    };
+
     auto record_tile_count = [&](int chunk_id) {
       if (thread_idx == 0 && params.prof_tile_count != nullptr) {
         if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
@@ -454,6 +482,12 @@ public:
     auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+    auto read_global_timer = []() {
+      uint64_t value;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+      return value;
+    };
 
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
@@ -575,10 +609,19 @@ public:
     // for stream k, may be invalid work tile info(M/N/L/K_idx = -1).
     if (work_tile_info.is_valid()) {
       for (int id = data_chunk_id_start; id <= data_chunk_id_end; ++id) {
-        uint64_t t0 = clock64();
+        bool need_wait_timer =
+            params.prof_wait_cycles != nullptr || params.prof_wait_enter_cycles != nullptr;
+        uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
         SystemBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
-        uint64_t t1 = clock64();
-        record_wait_cycles(id, t1 - t0);
+        uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+        if (params.prof_wait_cycles != nullptr) {
+          record_wait_cycles(id, t1 - t0);
+        } else {
+          record_wait_count_only(id);
+        }
+        if (params.prof_wait_enter_cycles != nullptr) {
+          record_wait_timeline(id, t0, t1);
+        }
       }
     }
 
@@ -622,10 +665,19 @@ public:
           if (new_data_chunk_id_start != data_chunk_id_start ||
               new_data_chunk_id_end != data_chunk_id_end) {
             for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
-              uint64_t t0 = clock64();
+              bool need_wait_timer =
+                  params.prof_wait_cycles != nullptr || params.prof_wait_enter_cycles != nullptr;
+              uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
               WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
-              uint64_t t1 = clock64();
-              record_wait_cycles(id, t1 - t0);
+              uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+              if (params.prof_wait_cycles != nullptr) {
+                record_wait_cycles(id, t1 - t0);
+              } else {
+                record_wait_count_only(id);
+              }
+              if (params.prof_wait_enter_cycles != nullptr) {
+                record_wait_timeline(id, t0, t1);
+              }
             }
           }
 

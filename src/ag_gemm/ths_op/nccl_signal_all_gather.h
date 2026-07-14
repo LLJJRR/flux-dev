@@ -48,6 +48,7 @@ class NcclSignalAllGather {
   ncclComm_t nccl_comm_ = nullptr;
   torch::Tensor signal_storage_;
   torch::Tensor counter_storage_;
+  torch::Tensor ready_cycles_storage_;
 };
 
 void flush_nccl_signal_events_after_sync();

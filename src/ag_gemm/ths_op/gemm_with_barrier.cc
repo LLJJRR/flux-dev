@@ -62,6 +62,17 @@ ag_wait_profile_enabled() {
 }
 
 inline bool
+ag_timeline_profile_enabled() {
+  static const bool enabled = std::getenv("FLUX_AG_TIMELINE_PROFILE") != nullptr;
+  return enabled;
+}
+
+inline bool
+ag_any_wait_profile_enabled() {
+  return ag_wait_profile_enabled() || ag_timeline_profile_enabled();
+}
+
+inline bool
 force_h100_agk_best_hparams_enabled() {
   return std::getenv("FLUX_FORCE_H100_AGK_BEST_HPARAMS") != nullptr;
 }
@@ -176,75 +187,134 @@ GemmWithBarirer::lazy_init_ag_wait_profile(torch::Tensor input, int n_data_chunk
   auto options_i64 = input.options().dtype(at::ScalarType::Long);
   auto options_i32 = input.options().dtype(at::ScalarType::Int);
 
-  if (!this->prof_wait_cycles_buffer.defined() ||
-      this->prof_wait_cycles_buffer.numel() < n_data_chunks) {
-    this->prof_wait_cycles_buffer = torch::empty({n_data_chunks}, options_i64);
+  if (ag_wait_profile_enabled()) {
+    if (!this->prof_wait_cycles_buffer.defined() ||
+        this->prof_wait_cycles_buffer.numel() < n_data_chunks) {
+      this->prof_wait_cycles_buffer = torch::empty({n_data_chunks}, options_i64);
+    }
+
+    if (!this->prof_wait_count_buffer.defined() ||
+        this->prof_wait_count_buffer.numel() < n_data_chunks) {
+      this->prof_wait_count_buffer = torch::empty({n_data_chunks}, options_i32);
+    }
+
+    if (!this->prof_tile_count_buffer.defined() ||
+        this->prof_tile_count_buffer.numel() < n_data_chunks) {
+      this->prof_tile_count_buffer = torch::empty({n_data_chunks}, options_i32);
+    }
   }
 
-  if (!this->prof_wait_count_buffer.defined() ||
-      this->prof_wait_count_buffer.numel() < n_data_chunks) {
-    this->prof_wait_count_buffer = torch::empty({n_data_chunks}, options_i32);
-  }
+  if (ag_timeline_profile_enabled()) {
+    if (!this->prof_wait_enter_cycles_buffer.defined() ||
+        this->prof_wait_enter_cycles_buffer.numel() < n_data_chunks) {
+      this->prof_wait_enter_cycles_buffer = torch::empty({n_data_chunks}, options_i64);
+    }
 
-  if (!this->prof_tile_count_buffer.defined() ||
-      this->prof_tile_count_buffer.numel() < n_data_chunks) {
-    this->prof_tile_count_buffer = torch::empty({n_data_chunks}, options_i32);
+    if (!this->prof_wait_exit_cycles_buffer.defined() ||
+        this->prof_wait_exit_cycles_buffer.numel() < n_data_chunks) {
+      this->prof_wait_exit_cycles_buffer = torch::empty({n_data_chunks}, options_i64);
+    }
   }
 }
 
 void
 GemmWithBarirer::reset_ag_wait_profile(cudaStream_t stream) {
-  if (!ag_wait_profile_enabled() || !this->prof_wait_cycles_buffer.defined()) {
+  if (!ag_any_wait_profile_enabled()) {
     return;
   }
 
-  CUDA_CHECK(cudaMemsetAsync(
-      this->prof_wait_cycles_buffer.data_ptr(),
-      0,
-      this->prof_wait_cycles_buffer.numel() * sizeof(int64_t),
-      stream));
-  CUDA_CHECK(cudaMemsetAsync(
-      this->prof_wait_count_buffer.data_ptr(),
-      0,
-      this->prof_wait_count_buffer.numel() * sizeof(int32_t),
-      stream));
-  CUDA_CHECK(cudaMemsetAsync(
-      this->prof_tile_count_buffer.data_ptr(),
-      0,
-      this->prof_tile_count_buffer.numel() * sizeof(int32_t),
-      stream));
+  if (ag_wait_profile_enabled() && this->prof_wait_cycles_buffer.defined()) {
+    CUDA_CHECK(cudaMemsetAsync(
+        this->prof_wait_cycles_buffer.data_ptr(),
+        0,
+        this->prof_wait_cycles_buffer.numel() * sizeof(int64_t),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        this->prof_wait_count_buffer.data_ptr(),
+        0,
+        this->prof_wait_count_buffer.numel() * sizeof(int32_t),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        this->prof_tile_count_buffer.data_ptr(),
+        0,
+        this->prof_tile_count_buffer.numel() * sizeof(int32_t),
+        stream));
+  }
+  if (ag_timeline_profile_enabled() && this->prof_wait_enter_cycles_buffer.defined()) {
+    CUDA_CHECK(cudaMemsetAsync(
+        this->prof_wait_enter_cycles_buffer.data_ptr(),
+        0,
+        this->prof_wait_enter_cycles_buffer.numel() * sizeof(int64_t),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        this->prof_wait_exit_cycles_buffer.data_ptr(),
+        0,
+        this->prof_wait_exit_cycles_buffer.numel() * sizeof(int64_t),
+        stream));
+  }
 }
 
 void
 GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
-  if (!ag_wait_profile_enabled() || !this->prof_wait_cycles_buffer.defined()) {
+  if (!ag_any_wait_profile_enabled()) {
     return;
   }
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  auto wait_cycles_cpu = this->prof_wait_cycles_buffer.cpu();
-  auto wait_count_cpu = this->prof_wait_count_buffer.cpu();
-  auto tile_count_cpu = this->prof_tile_count_buffer.cpu();
+  torch::Tensor wait_cycles_cpu;
+  torch::Tensor wait_count_cpu;
+  torch::Tensor tile_count_cpu;
+  torch::Tensor wait_enter_cpu;
+  torch::Tensor wait_exit_cpu;
 
-  auto *wait_cycles = wait_cycles_cpu.data_ptr<int64_t>();
-  auto *wait_count = wait_count_cpu.data_ptr<int32_t>();
-  auto *tile_count = tile_count_cpu.data_ptr<int32_t>();
+  int64_t *wait_cycles = nullptr;
+  int32_t *wait_count = nullptr;
+  int32_t *tile_count = nullptr;
+  int64_t *wait_enter = nullptr;
+  int64_t *wait_exit = nullptr;
 
-  int n_data_chunks = static_cast<int>(this->prof_wait_cycles_buffer.numel());
+  int n_data_chunks = 0;
+  if (ag_wait_profile_enabled() && this->prof_wait_cycles_buffer.defined()) {
+    wait_cycles_cpu = this->prof_wait_cycles_buffer.cpu();
+    wait_count_cpu = this->prof_wait_count_buffer.cpu();
+    tile_count_cpu = this->prof_tile_count_buffer.cpu();
+    wait_cycles = wait_cycles_cpu.data_ptr<int64_t>();
+    wait_count = wait_count_cpu.data_ptr<int32_t>();
+    tile_count = tile_count_cpu.data_ptr<int32_t>();
+    n_data_chunks = static_cast<int>(this->prof_wait_cycles_buffer.numel());
+  }
+
+  if (ag_timeline_profile_enabled() && this->prof_wait_enter_cycles_buffer.defined()) {
+    wait_enter_cpu = this->prof_wait_enter_cycles_buffer.cpu();
+    wait_exit_cpu = this->prof_wait_exit_cycles_buffer.cpu();
+    wait_enter = wait_enter_cpu.data_ptr<int64_t>();
+    wait_exit = wait_exit_cpu.data_ptr<int64_t>();
+    n_data_chunks = static_cast<int>(this->prof_wait_enter_cycles_buffer.numel());
+  }
+
   for (int i = 0; i < n_data_chunks; ++i) {
-    if (wait_count[i] == 0 && tile_count[i] == 0) {
-      continue;
+    if (wait_count != nullptr) {
+      if (wait_count[i] == 0 && tile_count[i] == 0) {
+        continue;
+      }
+      double avg_cycles =
+          wait_count[i] > 0 ? static_cast<double>(wait_cycles[i]) / wait_count[i] : 0.0;
+      std::cout << "[AG WAIT PROFILE] rank=" << this->rank
+                << " chunk=" << i
+                << " tiles=" << tile_count[i]
+                << " waits=" << wait_count[i]
+                << " cycles=" << wait_cycles[i]
+                << " avg_cycles=" << avg_cycles
+                << std::endl;
     }
-    double avg_cycles =
-        wait_count[i] > 0 ? static_cast<double>(wait_cycles[i]) / wait_count[i] : 0.0;
-    std::cout << "[AG WAIT PROFILE] rank=" << this->rank
-              << " chunk=" << i
-              << " tiles=" << tile_count[i]
-              << " waits=" << wait_count[i]
-              << " cycles=" << wait_cycles[i]
-              << " avg_cycles=" << avg_cycles
-              << std::endl;
+    if (wait_enter != nullptr && (wait_enter[i] != 0 || wait_exit[i] != 0)) {
+      std::cout << "[AG WAIT TIMELINE] rank=" << this->rank
+                << " chunk=" << i
+                << " wait_enter_globaltimer=" << wait_enter[i]
+                << " wait_exit_globaltimer=" << wait_exit[i]
+                << std::endl;
+    }
   }
 }
 
@@ -506,22 +576,34 @@ GemmWithBarirer::initialize(
             .device_index(c10::cuda::current_device()));
   }
   const bool wait_prof = ag_wait_profile_enabled();
+  const bool timeline_prof = ag_timeline_profile_enabled();
   int n_data_chunks = this->world_size * ::bytedance::flux::kAGGemmSplit;
 
   uint64_t *prof_wait_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
+  uint64_t *prof_wait_enter_cycles = nullptr;
+  uint64_t *prof_wait_exit_cycles = nullptr;
 
-  if (wait_prof) {
+  if (wait_prof || timeline_prof) {
     this->lazy_init_ag_wait_profile(input, n_data_chunks);
     this->reset_ag_wait_profile(stream);
+  }
 
+  if (wait_prof) {
     prof_wait_cycles =
         reinterpret_cast<uint64_t *>(this->prof_wait_cycles_buffer.data_ptr<int64_t>());
     prof_wait_count =
         reinterpret_cast<uint32_t *>(this->prof_wait_count_buffer.data_ptr<int32_t>());
     prof_tile_count =
         reinterpret_cast<uint32_t *>(this->prof_tile_count_buffer.data_ptr<int32_t>());
+  }
+
+  if (timeline_prof) {
+    prof_wait_enter_cycles =
+        reinterpret_cast<uint64_t *>(this->prof_wait_enter_cycles_buffer.data_ptr<int64_t>());
+    prof_wait_exit_cycles =
+        reinterpret_cast<uint64_t *>(this->prof_wait_exit_cycles_buffer.data_ptr<int64_t>());
   }
 
   std::any gemm_args;
@@ -559,7 +641,9 @@ GemmWithBarirer::initialize(
         .scaleAux = nullptr,
         .prof_wait_cycles = prof_wait_cycles,
         .prof_wait_count = prof_wait_count,
-        .prof_tile_count = prof_tile_count};
+        .prof_tile_count = prof_tile_count,
+        .prof_wait_enter_cycles = prof_wait_enter_cycles,
+        .prof_wait_exit_cycles = prof_wait_exit_cycles};
   } else if (is_s8_gemm) {
     // check input_scale
     FLUX_CHECK(input_scale.has_value());
@@ -592,7 +676,9 @@ GemmWithBarirer::initialize(
         .barrier_buffer = barrier.data_ptr(),
         .prof_wait_cycles = prof_wait_cycles,
         .prof_wait_count = prof_wait_count,
-        .prof_tile_count = prof_tile_count};
+        .prof_tile_count = prof_tile_count,
+        .prof_wait_enter_cycles = prof_wait_enter_cycles,
+        .prof_wait_exit_cycles = prof_wait_exit_cycles};
   } else {
     // AG GEMM Arguments
     gemm_args = AGKernelArguments{
@@ -611,7 +697,9 @@ GemmWithBarirer::initialize(
         .barrier_buffer = barrier.data_ptr(),
         .prof_wait_cycles = prof_wait_cycles,
         .prof_wait_count = prof_wait_count,
-        .prof_tile_count = prof_tile_count};
+        .prof_tile_count = prof_tile_count,
+        .prof_wait_enter_cycles = prof_wait_enter_cycles,
+        .prof_wait_exit_cycles = prof_wait_exit_cycles};
   }
 
   // AG Gemm Workspace
