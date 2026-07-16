@@ -197,6 +197,7 @@ public:
     int world_size = 0;
 
     uint64_t *prof_wait_cycles = nullptr;
+    uint64_t *prof_wait_max_cycles = nullptr;
     uint32_t *prof_wait_count = nullptr;
     uint32_t *prof_tile_count = nullptr;
     uint64_t *prof_wait_enter_cycles = nullptr;
@@ -219,6 +220,7 @@ public:
     int m_per_data_chunk;
 
     uint64_t *prof_wait_cycles = nullptr;
+    uint64_t *prof_wait_max_cycles = nullptr;
     uint32_t *prof_wait_count = nullptr;
     uint32_t *prof_tile_count = nullptr;
     uint64_t *prof_wait_enter_cycles = nullptr;
@@ -309,6 +311,7 @@ public:
         n_data_chunks,
         m_per_data_chunk,
         args.prof_wait_cycles,
+        args.prof_wait_max_cycles,
         args.prof_wait_count,
         args.prof_tile_count,
         args.prof_wait_enter_cycles,
@@ -442,6 +445,16 @@ public:
               reinterpret_cast<unsigned long long *>(&params.prof_wait_cycles[chunk_id]),
               static_cast<unsigned long long>(cycles));
           atomicAdd(&params.prof_wait_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto record_wait_max_cycles = [&](int chunk_id, uint64_t cycles) {
+      if (thread_idx == 0 && params.prof_wait_max_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicMax(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_max_cycles[chunk_id]),
+              static_cast<unsigned long long>(cycles));
         }
       }
     };
@@ -610,10 +623,12 @@ public:
     if (work_tile_info.is_valid()) {
       for (int id = data_chunk_id_start; id <= data_chunk_id_end; ++id) {
         bool need_wait_timer =
-            params.prof_wait_cycles != nullptr || params.prof_wait_enter_cycles != nullptr;
+            params.prof_wait_cycles != nullptr || params.prof_wait_max_cycles != nullptr ||
+            params.prof_wait_enter_cycles != nullptr;
         uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
         SystemBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
         uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+        record_wait_max_cycles(id, t1 - t0);
         if (params.prof_wait_cycles != nullptr) {
           record_wait_cycles(id, t1 - t0);
         } else {
@@ -666,10 +681,12 @@ public:
               new_data_chunk_id_end != data_chunk_id_end) {
             for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
               bool need_wait_timer =
-                  params.prof_wait_cycles != nullptr || params.prof_wait_enter_cycles != nullptr;
+                  params.prof_wait_cycles != nullptr || params.prof_wait_max_cycles != nullptr ||
+                  params.prof_wait_enter_cycles != nullptr;
               uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
               WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
               uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+              record_wait_max_cycles(id, t1 - t0);
               if (params.prof_wait_cycles != nullptr) {
                 record_wait_cycles(id, t1 - t0);
               } else {

@@ -19,7 +19,9 @@
 #include "flux/ths_op/flux_shm.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <cuda_runtime_api.h>
 #include <torch/torch.h>
@@ -49,8 +51,10 @@ class NcclSignalAllGather {
   torch::Tensor signal_storage_;
   torch::Tensor counter_storage_;
   torch::Tensor ready_cycles_storage_;
+  uint64_t profile_launch_id_ = 0;
 };
 
 void flush_nccl_signal_events_after_sync();
+std::vector<uint64_t> consume_nccl_signal_ready_cycles(int rank);
 
 }  // namespace bytedance::flux::ths_op

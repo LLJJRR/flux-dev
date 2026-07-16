@@ -38,10 +38,14 @@ class GemmWithBarirer {
 
   // AG wait profiling buffers. Enabled only by FLUX_AG_WAIT_PROFILE=1.
   torch::Tensor prof_wait_cycles_buffer;
+  torch::Tensor prof_wait_max_cycles_buffer;
   torch::Tensor prof_wait_count_buffer;
   torch::Tensor prof_tile_count_buffer;
   torch::Tensor prof_wait_enter_cycles_buffer;
   torch::Tensor prof_wait_exit_cycles_buffer;
+  uint64_t prof_next_launch_id = 0;
+  uint64_t prof_current_launch_id = 0;
+  bool prof_timeline_active = false;
 
  private:
   void lazy_init_gemm_buffer(torch::Tensor input, int64_t buffer_size);

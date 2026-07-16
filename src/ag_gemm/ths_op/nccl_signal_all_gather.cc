@@ -74,6 +74,21 @@ ag_timeline_profile_enabled() {
   return std::getenv("FLUX_AG_TIMELINE_PROFILE") != nullptr;
 }
 
+bool
+ag_timeline_profile_enabled_for_rank(int rank) {
+  if (!ag_timeline_profile_enabled()) {
+    return false;
+  }
+  const char *target_rank = std::getenv("FLUX_AG_TIMELINE_PROFILE_RANK");
+  return target_rank == nullptr || rank == std::atoi(target_rank);
+}
+
+bool
+ag_timeline_profile_launch_selected(uint64_t launch_id) {
+  const char *target_launch = std::getenv("FLUX_AG_TIMELINE_PROFILE_LAUNCH");
+  return target_launch == nullptr || launch_id == std::strtoull(target_launch, nullptr, 10);
+}
+
 void
 nccl_signal_debug(int rank, const char *message) {
   if (nccl_signal_debug_enabled()) {
@@ -136,6 +151,29 @@ make_byte_storage(size_t nbytes) {
 
 }  // namespace
 
+std::vector<uint64_t>
+consume_nccl_signal_ready_cycles(int rank) {
+  torch::Tensor ready_cycles_storage;
+  {
+    std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
+    for (auto iter = nccl_signal_timelines.begin(); iter != nccl_signal_timelines.end(); ++iter) {
+      if (iter->rank != rank) {
+        continue;
+      }
+      ready_cycles_storage = iter->ready_cycles;
+      nccl_signal_timelines.erase(iter);
+      break;
+    }
+  }
+  if (!ready_cycles_storage.defined()) {
+    return {};
+  }
+  auto ready_cycles_cpu = ready_cycles_storage.cpu();
+  auto *ready_cycles = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
+  int n_data_chunks = static_cast<int>(ready_cycles_storage.nbytes() / sizeof(uint64_t));
+  return std::vector<uint64_t>(ready_cycles, ready_cycles + n_data_chunks);
+}
+
 void
 flush_nccl_signal_events_after_sync() {
   if (!nccl_signal_event_profile_enabled() && !ag_timeline_profile_enabled()) {
@@ -164,19 +202,9 @@ flush_nccl_signal_events_after_sync() {
     }
   }
 
-  if (ag_timeline_profile_enabled()) {
-    for (auto &timeline : timelines) {
-      auto ready_cycles_cpu = timeline.ready_cycles.cpu();
-      auto *ready_cycles = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
-      int n_data_chunks = static_cast<int>(timeline.ready_cycles.nbytes() / sizeof(uint64_t));
-      for (int i = 0; i < n_data_chunks; ++i) {
-        std::cout << "[NCCL SIGNAL TIMELINE] rank=" << timeline.rank
-                  << " chunk=" << i
-                  << " ready_globaltimer=" << ready_cycles[i]
-                  << std::endl;
-      }
-    }
-  }
+  // Timeline records are consumed and printed together with AG wait records by
+  // GemmWithBarirer::dump_ag_wait_profile(). If they reach this point, discard
+  // them silently to avoid noisy standalone NCCL prints that are hard to match.
 }
 
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
@@ -235,6 +263,8 @@ NcclSignalAllGather::run(
     return;
   }
 
+  uint64_t profile_launch_id = this->profile_launch_id_++;
+
   cudaEvent_t total_start{};
   cudaEvent_t total_stop{};
   cudaEvent_t counter_start{};
@@ -261,7 +291,10 @@ NcclSignalAllGather::run(
       0,
       counter_storage_.nbytes(),
       stream));
-  if (ag_timeline_profile_enabled()) {
+  const bool timeline_profile =
+      ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
+      ag_timeline_profile_launch_selected(profile_launch_id);
+  if (timeline_profile) {
     if (!ready_cycles_storage_.defined()) {
       ready_cycles_storage_ = make_byte_storage(sizeof(uint64_t) * group_->get_size());
     }
@@ -282,7 +315,7 @@ NcclSignalAllGather::run(
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
       .split = 1,
-      .readyCycles = ag_timeline_profile_enabled()
+      .readyCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr())
           : nullptr,
   };
@@ -326,7 +359,7 @@ NcclSignalAllGather::run(
         group_->get_rank(), "nccl_signal_run_total", total_start, total_stop);
   }
 
-  if (ag_timeline_profile_enabled()) {
+  if (timeline_profile) {
     nccl_signal_timeline_push(group_->get_rank(), ready_cycles_storage_);
   }
 }

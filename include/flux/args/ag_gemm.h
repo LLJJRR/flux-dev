@@ -35,6 +35,7 @@ struct AGKernelArguments {
   void *barrier_buffer;
 
   uint64_t *prof_wait_cycles = nullptr;
+  uint64_t *prof_wait_max_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
   uint64_t *prof_wait_enter_cycles = nullptr;
@@ -59,6 +60,7 @@ struct AGS8KernelArguments {
   void *barrier_buffer;
 
   uint64_t *prof_wait_cycles = nullptr;
+  uint64_t *prof_wait_max_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
   uint64_t *prof_wait_enter_cycles = nullptr;
@@ -90,6 +92,7 @@ struct AGFP8KernelArguments {
   float const *scaleAux = nullptr;
 
   uint64_t *prof_wait_cycles = nullptr;
+  uint64_t *prof_wait_max_cycles = nullptr;
   uint32_t *prof_wait_count = nullptr;
   uint32_t *prof_tile_count = nullptr;
   uint64_t *prof_wait_enter_cycles = nullptr;

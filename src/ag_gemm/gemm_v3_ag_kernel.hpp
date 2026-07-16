@@ -69,6 +69,7 @@ void
 set_ag_wait_profile_args(GemmArguments &gemm_args, Args const &args) {
   if constexpr (HasAGWaitProfileFields<GemmArguments>::value) {
     gemm_args.prof_wait_cycles = args.prof_wait_cycles;
+    gemm_args.prof_wait_max_cycles = args.prof_wait_max_cycles;
     gemm_args.prof_wait_count = args.prof_wait_count;
     gemm_args.prof_tile_count = args.prof_tile_count;
     gemm_args.prof_wait_enter_cycles = args.prof_wait_enter_cycles;

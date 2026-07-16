@@ -51,6 +51,8 @@
 // clang-format off
 #pragma once
 
+#include <cstdint>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/workspace.h"
 #include "cutlass/kernel_hardware_info.hpp"
@@ -206,6 +208,12 @@ public:
     void *ptr_barrier = nullptr;
     int rank = 0;
     int world_size = 0;
+    uint64_t *prof_wait_cycles = nullptr;
+    uint64_t *prof_wait_max_cycles = nullptr;
+    uint32_t *prof_wait_count = nullptr;
+    uint32_t *prof_tile_count = nullptr;
+    uint64_t *prof_wait_enter_cycles = nullptr;
+    uint64_t *prof_wait_exit_cycles = nullptr;
   };
 
   // Kernel entry point API
@@ -223,6 +231,12 @@ public:
     int n_data_chunks;
     int m_per_data_chunk;
     void *workspace{nullptr};
+    uint64_t *prof_wait_cycles = nullptr;
+    uint64_t *prof_wait_max_cycles = nullptr;
+    uint32_t *prof_wait_count = nullptr;
+    uint32_t *prof_tile_count = nullptr;
+    uint64_t *prof_wait_enter_cycles = nullptr;
+    uint64_t *prof_wait_exit_cycles = nullptr;
   };
 
   //
@@ -298,6 +312,12 @@ public:
       n_data_chunks,
       m_per_data_chunk,
       workspace,
+      args.prof_wait_cycles,
+      args.prof_wait_max_cycles,
+      args.prof_wait_count,
+      args.prof_tile_count,
+      args.prof_wait_enter_cycles,
+      args.prof_wait_exit_cycles,
     };
   }
 
@@ -415,6 +435,63 @@ public:
     auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
     int lane_predicate = cute::elect_one_sync();
     uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+    auto record_wait_cycles = [&](int chunk_id, uint64_t cycles) {
+      if (thread_idx == 0 && params.prof_wait_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_cycles[chunk_id]),
+              static_cast<unsigned long long>(cycles));
+          atomicAdd(&params.prof_wait_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto record_wait_max_cycles = [&](int chunk_id, uint64_t cycles) {
+      if (thread_idx == 0 && params.prof_wait_max_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicMax(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_max_cycles[chunk_id]),
+              static_cast<unsigned long long>(cycles));
+        }
+      }
+    };
+
+    auto record_wait_count_only = [&](int chunk_id) {
+      if (thread_idx == 0 && params.prof_wait_count != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(&params.prof_wait_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto record_wait_timeline = [&](int chunk_id, uint64_t enter_cycles, uint64_t exit_cycles) {
+      if (thread_idx == 0 && params.prof_wait_enter_cycles != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          unsigned long long old = atomicCAS(
+              reinterpret_cast<unsigned long long *>(&params.prof_wait_enter_cycles[chunk_id]),
+              0ull,
+              static_cast<unsigned long long>(enter_cycles));
+          if (old == 0ull) {
+            params.prof_wait_exit_cycles[chunk_id] = exit_cycles;
+          }
+        }
+      }
+    };
+
+    auto record_tile_count = [&](int chunk_id) {
+      if (thread_idx == 0 && params.prof_tile_count != nullptr) {
+        if (chunk_id >= 0 && chunk_id < params.n_data_chunks) {
+          atomicAdd(&params.prof_tile_count[chunk_id], 1u);
+        }
+      }
+    };
+
+    auto read_global_timer = []() {
+      uint64_t value;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+      return value;
+    };
 
     // Issue Tma Descriptor Prefetch from a single thread
     if ((warp_idx == 0) && lane_predicate) {
@@ -556,10 +633,38 @@ public:
     if (work_tile_info.is_valid()) {
       // Consumer0 and Consumer1 calculate different tile.
       if (data_chunk_id_start == data_chunk_id_end) {
+        bool need_wait_timer =
+            params.prof_wait_cycles != nullptr || params.prof_wait_max_cycles != nullptr ||
+            params.prof_wait_enter_cycles != nullptr;
+        uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
         warpgroup_wait_eq(data_chunk_id_end);
+        uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+        record_wait_max_cycles(data_chunk_id_end, t1 - t0);
+        if (params.prof_wait_cycles != nullptr) {
+          record_wait_cycles(data_chunk_id_end, t1 - t0);
+        } else {
+          record_wait_count_only(data_chunk_id_end);
+        }
+        if (params.prof_wait_enter_cycles != nullptr) {
+          record_wait_timeline(data_chunk_id_end, t0, t1);
+        }
       } else {
         for (int id = data_chunk_id_start; id <= data_chunk_id_end; ++id) {
+          bool need_wait_timer =
+              params.prof_wait_cycles != nullptr || params.prof_wait_max_cycles != nullptr ||
+              params.prof_wait_enter_cycles != nullptr;
+          uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
           warpgroup_wait_eq(id);
+          uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+          record_wait_max_cycles(id, t1 - t0);
+          if (params.prof_wait_cycles != nullptr) {
+            record_wait_cycles(id, t1 - t0);
+          } else {
+            record_wait_count_only(id);
+          }
+          if (params.prof_wait_enter_cycles != nullptr) {
+            record_wait_timeline(id, t0, t1);
+          }
         }
       }
       __syncthreads();
@@ -595,10 +700,28 @@ public:
                                       ? new_data_chunk_id_end
                                       : (params.n_data_chunks - 1);
 
+          for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+            record_tile_count(id);
+          }
+
           if (new_data_chunk_id_start != data_chunk_id_start ||
               new_data_chunk_id_end != data_chunk_id_end) {
             for (int id = new_data_chunk_id_start; id <= new_data_chunk_id_end; ++id) {
+              bool need_wait_timer =
+                  params.prof_wait_cycles != nullptr || params.prof_wait_max_cycles != nullptr ||
+                  params.prof_wait_enter_cycles != nullptr;
+              uint64_t t0 = need_wait_timer ? read_global_timer() : 0;
               WarpBarrier::wait_eq(params.ptr_barrier, thread_idx, id, 1);
+              uint64_t t1 = need_wait_timer ? read_global_timer() : 0;
+              record_wait_max_cycles(id, t1 - t0);
+              if (params.prof_wait_cycles != nullptr) {
+                record_wait_cycles(id, t1 - t0);
+              } else {
+                record_wait_count_only(id);
+              }
+              if (params.prof_wait_enter_cycles != nullptr) {
+                record_wait_timeline(id, t0, t1);
+              }
             }
           }
           
