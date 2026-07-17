@@ -27,6 +27,7 @@
 #include "flux/cuda/cuda_stub.h"
 #include "flux/utils.h"
 #include "flux/ag_gemm_split.h"
+#include "coll/ths_op/ag_event_profiler.h"
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
 #include <c10/core/DeviceType.h>
@@ -45,10 +46,6 @@ namespace {
 constexpr int SPLIT = ::bytedance::flux::kAGGemmSplit;
 constexpr int kNumSignals = ::bytedance::flux::kAGGemmNumSignals;
 
-inline bool ag_event_profile_enabled() {
-  return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
-}
-
 struct AgRecordedEvent {
   const char *name;
   int rank;
@@ -57,36 +54,6 @@ struct AgRecordedEvent {
 };
 
 static thread_local std::vector<AgRecordedEvent> g_ag_recorded_events;
-
-struct AgEventTimer {
-  const char *name;
-  int rank;
-  cudaStream_t stream;
-  cudaEvent_t start{};
-  cudaEvent_t stop{};
-  bool enabled;
-
-  AgEventTimer(const char *name_, int rank_, cudaStream_t stream_)
-      : name(name_),
-        rank(rank_),
-        stream(stream_),
-        enabled(ag_event_profile_enabled()) {
-    if (enabled) {
-      CUDA_CHECK(cudaEventCreate(&start));
-      CUDA_CHECK(cudaEventCreate(&stop));
-      CUDA_CHECK(cudaEventRecord(start, stream));
-    }
-  }
-
-  ~AgEventTimer() {
-    if (!enabled) {
-      return;
-    }
-
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    g_ag_recorded_events.push_back(AgRecordedEvent{name, rank, start, stop});
-  }
-};
 
 struct SplitRange {
   size_t offset;
@@ -128,12 +95,36 @@ get_scale_split_range(
 
 }  // namespace
 
+bool
+ag_event_profile_enabled() {
+  return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
+}
+
+AgEventTimer::AgEventTimer(const char *name, int rank, cudaStream_t stream)
+    : name_(name),
+      rank_(rank),
+      stream_(stream),
+      enabled_(ag_event_profile_enabled()) {
+  if (enabled_) {
+    CUDA_CHECK(cudaEventCreate(&start_));
+    CUDA_CHECK(cudaEventCreate(&stop_));
+    CUDA_CHECK(cudaEventRecord(start_, stream_));
+  }
+}
+
+AgEventTimer::~AgEventTimer() {
+  if (!enabled_) {
+    return;
+  }
+  CUDA_CHECK(cudaEventRecord(stop_, stream_));
+  g_ag_recorded_events.push_back(AgRecordedEvent{name_, rank_, start_, stop_});
+}
+
 void
 flush_ag_events_after_sync() {
   if (!ag_event_profile_enabled()) {
     return;
   }
-
   for (auto &event : g_ag_recorded_events) {
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));

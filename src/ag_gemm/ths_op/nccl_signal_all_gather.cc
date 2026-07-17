@@ -17,6 +17,7 @@
 
 #include "ag_gemm/ths_op/nccl_signal_all_gather.h"
 
+#include "coll/ths_op/ag_event_profiler.h"
 #include "flux/cuda/cuda_common.h"
 #include "flux/flux.h"
 
@@ -25,22 +26,13 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <mutex>
-#include <string>
 #include <utility>
 #include <vector>
 
 namespace bytedance::flux::ths_op {
 
 namespace {
-
-struct NcclSignalEvent {
-  int rank;
-  std::string name;
-  cudaEvent_t start;
-  cudaEvent_t stop;
-};
 
 struct NcclSignalTimeline {
   int rank;
@@ -55,18 +47,12 @@ struct FluxNcclSignalLayout {
   unsigned long long *readyCycles;
 };
 
-std::mutex nccl_signal_events_mutex;
-std::vector<NcclSignalEvent> nccl_signal_events;
 std::vector<NcclSignalTimeline> nccl_signal_timelines;
+std::mutex nccl_signal_events_mutex;
 
 bool
 nccl_signal_debug_enabled() {
   return std::getenv("FLUX_AG_NCCL_DEBUG") != nullptr;
-}
-
-bool
-nccl_signal_event_profile_enabled() {
-  return std::getenv("FLUX_AG_NCCL_EVENT_PROFILE") != nullptr;
 }
 
 bool
@@ -95,22 +81,6 @@ nccl_signal_debug(int rank, const char *message) {
     std::fprintf(stderr, "[FLUX_AG_NCCL_DEBUG] rank=%d %s\n", rank, message);
     std::fflush(stderr);
   }
-}
-
-void
-nccl_signal_event_create(cudaEvent_t *event) {
-  CUDA_CHECK(cudaEventCreate(event));
-}
-
-void
-nccl_signal_event_record(cudaEvent_t event, cudaStream_t stream) {
-  CUDA_CHECK(cudaEventRecord(event, stream));
-}
-
-void
-nccl_signal_event_push(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop) {
-  std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
-  nccl_signal_events.push_back(NcclSignalEvent{rank, name, start, stop});
 }
 
 void
@@ -174,39 +144,6 @@ consume_nccl_signal_ready_cycles(int rank) {
   return std::vector<uint64_t>(ready_cycles, ready_cycles + n_data_chunks);
 }
 
-void
-flush_nccl_signal_events_after_sync() {
-  if (!nccl_signal_event_profile_enabled() && !ag_timeline_profile_enabled()) {
-    return;
-  }
-
-  std::vector<NcclSignalEvent> events;
-  std::vector<NcclSignalTimeline> timelines;
-  {
-    std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
-    events.swap(nccl_signal_events);
-    timelines.swap(nccl_signal_timelines);
-  }
-
-  if (nccl_signal_event_profile_enabled()) {
-    for (auto &event : events) {
-      CUDA_CHECK(cudaEventSynchronize(event.stop));
-      float ms = 0.0f;
-      CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));
-      std::cout << "[NCCL SIGNAL EVENT] rank=" << event.rank
-                << " name=" << event.name
-                << " ms=" << ms
-                << std::endl;
-      CUDA_CHECK(cudaEventDestroy(event.start));
-      CUDA_CHECK(cudaEventDestroy(event.stop));
-    }
-  }
-
-  // Timeline records are consumed and printed together with AG wait records by
-  // GemmWithBarirer::dump_ag_wait_profile(). If they reach this point, discard
-  // them silently to avoid noisy standalone NCCL prints that are hard to match.
-}
-
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
@@ -237,13 +174,7 @@ NcclSignalAllGather::run(
   FLUX_CHECK_GT(bytes_per_rank, 0);
 
   if (!emit_signal) {
-    cudaEvent_t standard_start{};
-    cudaEvent_t standard_stop{};
-    if (nccl_signal_event_profile_enabled()) {
-      nccl_signal_event_create(&standard_start);
-      nccl_signal_event_create(&standard_stop);
-      nccl_signal_event_record(standard_start, stream);
-    }
+    AgEventTimer timer("standard_ncclAllGather_total", group_->get_rank(), stream);
 
     nccl_signal_debug(group_->get_rank(), "standard ncclAllGather begin");
     NCCL_CHECK(ncclAllGather(
@@ -255,42 +186,21 @@ NcclSignalAllGather::run(
         stream));
     nccl_signal_debug(group_->get_rank(), "standard ncclAllGather end");
 
-    if (nccl_signal_event_profile_enabled()) {
-      nccl_signal_event_record(standard_stop, stream);
-      nccl_signal_event_push(
-          group_->get_rank(), "standard_ncclAllGather_total", standard_start, standard_stop);
-    }
     return;
   }
 
   uint64_t profile_launch_id = this->profile_launch_id_++;
 
-  cudaEvent_t total_start{};
-  cudaEvent_t total_stop{};
-  cudaEvent_t counter_start{};
-  cudaEvent_t counter_stop{};
-  cudaEvent_t desc_start{};
-  cudaEvent_t desc_stop{};
-  cudaEvent_t allgather_start{};
-  cudaEvent_t allgather_stop{};
-  if (nccl_signal_event_profile_enabled()) {
-    nccl_signal_event_create(&total_start);
-    nccl_signal_event_create(&total_stop);
-    nccl_signal_event_create(&counter_start);
-    nccl_signal_event_create(&counter_stop);
-    nccl_signal_event_create(&desc_start);
-    nccl_signal_event_create(&desc_stop);
-    nccl_signal_event_create(&allgather_start);
-    nccl_signal_event_create(&allgather_stop);
-    nccl_signal_event_record(total_start, stream);
-    nccl_signal_event_record(counter_start, stream);
-  }
+  AgEventTimer total_timer("nccl_signal_run_total", group_->get_rank(), stream);
 
-  CUDA_CHECK(cudaMemsetAsync(
-      counter_storage_.data_ptr(),
-      0,
-      counter_storage_.nbytes(),
-      stream));
+  {
+    AgEventTimer timer("counter_memset", group_->get_rank(), stream);
+    CUDA_CHECK(cudaMemsetAsync(
+        counter_storage_.data_ptr(),
+        0,
+        counter_storage_.nbytes(),
+        stream));
+  }
   const bool timeline_profile =
       ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
       ag_timeline_profile_launch_selected(profile_launch_id);
@@ -305,10 +215,6 @@ NcclSignalAllGather::run(
         stream));
   }
 
-  if (nccl_signal_event_profile_enabled()) {
-    nccl_signal_event_record(counter_stop, stream);
-  }
-
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
   FluxNcclSignalLayout signal = {
       .barrier = static_cast<int *>(barrier_buffer),
@@ -320,44 +226,30 @@ NcclSignalAllGather::run(
           : nullptr,
   };
 
-  if (nccl_signal_event_profile_enabled()) {
-    nccl_signal_event_record(desc_start, stream);
+  {
+    AgEventTimer timer("signal_desc_h2d", group_->get_rank(), stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        signal_storage_.data_ptr(),
+        &signal,
+        sizeof(signal),
+        cudaMemcpyHostToDevice,
+        stream));
   }
-
-  CUDA_CHECK(cudaMemcpyAsync(
-      signal_storage_.data_ptr(),
-      &signal,
-      sizeof(signal),
-      cudaMemcpyHostToDevice,
-      stream));
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync end");
 
-  if (nccl_signal_event_profile_enabled()) {
-    nccl_signal_event_record(desc_stop, stream);
-    nccl_signal_event_record(allgather_start, stream);
+  {
+    AgEventTimer timer("ncclAllGatherFluxSignal_total", group_->get_rank(), stream);
+    nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal begin");
+    NCCL_CHECK(ncclAllGatherFluxSignal(
+        input,
+        input_buffer,
+        bytes_per_rank,
+        ncclInt8,
+        reinterpret_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
+        nccl_comm_,
+        stream));
   }
-
-  nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal begin");
-  NCCL_CHECK(ncclAllGatherFluxSignal(
-      input,
-      input_buffer,
-      bytes_per_rank,
-      ncclInt8,
-      reinterpret_cast<const ncclFluxAgSignal_t *>(signal_storage_.data_ptr()),
-      nccl_comm_,
-      stream));
   nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal end");
-
-  if (nccl_signal_event_profile_enabled()) {
-    nccl_signal_event_record(allgather_stop, stream);
-    nccl_signal_event_record(total_stop, stream);
-    nccl_signal_event_push(group_->get_rank(), "counter_memset", counter_start, counter_stop);
-    nccl_signal_event_push(group_->get_rank(), "signal_desc_h2d", desc_start, desc_stop);
-    nccl_signal_event_push(
-        group_->get_rank(), "ncclAllGatherFluxSignal_total", allgather_start, allgather_stop);
-    nccl_signal_event_push(
-        group_->get_rank(), "nccl_signal_run_total", total_start, total_stop);
-  }
 
   if (timeline_profile) {
     nccl_signal_timeline_push(group_->get_rank(), ready_cycles_storage_);
