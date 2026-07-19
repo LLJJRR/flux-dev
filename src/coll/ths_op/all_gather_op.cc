@@ -15,7 +15,9 @@
 //
 //===----------------------------------------------------------------------===//
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include "coll/all_gather_impls.hpp"
 #include "coll/local_copy_and_reset.hpp"
