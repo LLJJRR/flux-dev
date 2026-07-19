@@ -37,6 +37,8 @@ namespace {
 struct PendingNcclSignalTimeline {
   int rank;
   torch::Tensor timeline;
+  size_t bytes_per_rank;
+  int nranks;
 };
 
 struct FluxNcclSignalLayout {
@@ -86,9 +88,10 @@ nccl_signal_debug(int rank, const char *message) {
 }
 
 void
-nccl_signal_timeline_push(int rank, torch::Tensor ready_cycles) {
+nccl_signal_timeline_push(int rank, torch::Tensor ready_cycles, size_t bytes_per_rank, int nranks) {
   std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
-  nccl_signal_timelines.push_back(PendingNcclSignalTimeline{rank, ready_cycles});
+  nccl_signal_timelines.push_back(
+      PendingNcclSignalTimeline{rank, ready_cycles, bytes_per_rank, nranks});
 }
 
 ncclComm_t
@@ -126,6 +129,8 @@ make_byte_storage(size_t nbytes) {
 NcclSignalTimeline
 consume_nccl_signal_timeline(int rank) {
   torch::Tensor ready_cycles_storage;
+  size_t bytes_per_rank = 0;
+  int nranks = 0;
   {
     std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
     for (auto iter = nccl_signal_timelines.begin(); iter != nccl_signal_timelines.end(); ++iter) {
@@ -133,6 +138,8 @@ consume_nccl_signal_timeline(int rank) {
         continue;
       }
       ready_cycles_storage = iter->timeline;
+      bytes_per_rank = iter->bytes_per_rank;
+      nranks = iter->nranks;
       nccl_signal_timelines.erase(iter);
       break;
     }
@@ -147,7 +154,11 @@ consume_nccl_signal_timeline(int rank) {
     return {};
   }
   return NcclSignalTimeline{
-      timeline[0], timeline[1], std::vector<uint64_t>(timeline + 2, timeline + 2 + n_data_chunks)};
+      timeline[0],
+      timeline[1],
+      bytes_per_rank,
+      nranks,
+      std::vector<uint64_t>(timeline + 2, timeline + 2 + n_data_chunks)};
 }
 
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
@@ -268,7 +279,8 @@ NcclSignalAllGather::run(
   nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal end");
 
   if (timeline_profile) {
-    nccl_signal_timeline_push(group_->get_rank(), ready_cycles_storage_);
+    nccl_signal_timeline_push(
+        group_->get_rank(), ready_cycles_storage_, bytes_per_rank, group_->get_size());
   }
 }
 

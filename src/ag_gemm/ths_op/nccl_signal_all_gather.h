@@ -55,8 +55,10 @@ class NcclSignalAllGather {
 };
 
 struct NcclSignalTimeline {
-  uint64_t start;
-  uint64_t end;
+  uint64_t start = 0;
+  uint64_t end = 0;
+  size_t bytes_per_rank = 0;
+  int nranks = 0;
   std::vector<uint64_t> ready;
 };
 

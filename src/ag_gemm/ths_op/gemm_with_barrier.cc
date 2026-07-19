@@ -416,7 +416,9 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
   int32_t *tile_count = nullptr;
   int64_t *wait_enter = nullptr;
   int64_t *wait_exit = nullptr;
-  ths_op::NcclSignalTimeline nccl_timeline;
+  // No NCCL timeline is valid until it has been consumed from the signal path.
+  // Value-initialize this object so native launches cannot emit garbage records.
+  ths_op::NcclSignalTimeline nccl_timeline{};
   uint64_t launch_id = this->prof_current_launch_id;
 
   int n_data_chunks = 0;
@@ -455,6 +457,8 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
     line << "[AG NCCL TIMELINE] rank=" << this->rank
          << " mode=" << profile_mode
          << " launch=" << launch_id
+         << " bytes_per_rank=" << nccl_timeline.bytes_per_rank
+         << " nranks=" << nccl_timeline.nranks
          << " start_globaltimer=" << nccl_timeline.start
          << " end_globaltimer=" << nccl_timeline.end
          << " duration_globaltimer="
@@ -462,7 +466,14 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
                  ? nccl_timeline.end - nccl_timeline.start
                  : 0)
          << " status=" << (nccl_timeline.end != 0 ? "complete" : "incomplete")
-         << '\n';
+         << " ready_globaltimer=";
+    for (size_t i = 0; i < nccl_timeline.ready.size(); ++i) {
+      if (i != 0) {
+        line << ',';
+      }
+      line << nccl_timeline.ready[i];
+    }
+    line << '\n';
     ths_op::ag_profile_append(line.str());
   }
   std::ostringstream profile_output;
