@@ -48,12 +48,24 @@ constexpr int kNumSignals = ::bytedance::flux::kAGGemmNumSignals;
 
 struct AgRecordedEvent {
   const char *name;
+  const char *mode;
   int rank;
+  uint64_t launch_id;
   cudaEvent_t start{};
   cudaEvent_t stop{};
 };
 
 static thread_local std::vector<AgRecordedEvent> g_ag_recorded_events;
+static thread_local std::string g_ag_profile_output;
+
+struct AgProfileContext {
+  const char *mode = "standalone";
+  int rank = -1;
+  uint64_t launch_id = 0;
+  bool active = false;
+};
+
+static thread_local AgProfileContext g_ag_profile_context;
 
 struct SplitRange {
   size_t offset;
@@ -100,9 +112,48 @@ ag_event_profile_enabled() {
   return std::getenv("FLUX_AG_EVENT_PROFILE") != nullptr;
 }
 
+bool
+ag_profile_context_active() {
+  return g_ag_profile_context.active;
+}
+
+const char *
+ag_profile_mode() {
+  return g_ag_profile_context.mode;
+}
+
+uint64_t
+ag_profile_launch_id() {
+  return g_ag_profile_context.launch_id;
+}
+
+AgEventProfilerScope::AgEventProfilerScope(const char *mode, int rank, uint64_t launch_id) {
+  g_ag_profile_context = AgProfileContext{mode, rank, launch_id, true};
+}
+
+AgEventProfilerScope::~AgEventProfilerScope() {
+  g_ag_profile_context = AgProfileContext{};
+}
+
+void
+ag_profile_append(std::string text) {
+  g_ag_profile_output += std::move(text);
+}
+
+void
+ag_profile_flush() {
+  if (!g_ag_profile_output.empty()) {
+    std::fwrite(g_ag_profile_output.data(), 1, g_ag_profile_output.size(), stdout);
+    std::fflush(stdout);
+    g_ag_profile_output.clear();
+  }
+}
+
 AgEventTimer::AgEventTimer(const char *name, int rank, cudaStream_t stream)
     : name_(name),
+      mode_(ag_profile_mode()),
       rank_(rank),
+      launch_id_(ag_profile_launch_id()),
       stream_(stream),
       enabled_(ag_event_profile_enabled()) {
   if (enabled_) {
@@ -117,7 +168,8 @@ AgEventTimer::~AgEventTimer() {
     return;
   }
   CUDA_CHECK(cudaEventRecord(stop_, stream_));
-  g_ag_recorded_events.push_back(AgRecordedEvent{name_, rank_, start_, stop_});
+  g_ag_recorded_events.push_back(
+      AgRecordedEvent{name_, mode_, rank_, launch_id_, start_, stop_});
 }
 
 void
@@ -129,10 +181,13 @@ flush_ag_events_after_sync() {
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, event.start, event.stop));
 
-    std::cout << "[AG EVENT] rank=" << event.rank
-              << " name=" << event.name
-              << " ms=" << ms
-              << std::endl;
+    std::ostringstream line;
+    line << "[AG EVENT] rank=" << event.rank
+         << " mode=" << event.mode
+         << " launch=" << event.launch_id
+         << " name=" << event.name
+         << " ms=" << ms << '\n';
+    ag_profile_append(line.str());
 
     CUDA_CHECK(cudaEventDestroy(event.start));
     CUDA_CHECK(cudaEventDestroy(event.stop));

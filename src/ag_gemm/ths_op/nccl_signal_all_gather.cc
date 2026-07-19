@@ -34,9 +34,9 @@ namespace bytedance::flux::ths_op {
 
 namespace {
 
-struct NcclSignalTimeline {
+struct PendingNcclSignalTimeline {
   int rank;
-  torch::Tensor ready_cycles;
+  torch::Tensor timeline;
 };
 
 struct FluxNcclSignalLayout {
@@ -45,9 +45,11 @@ struct FluxNcclSignalLayout {
   int *launchSignal;
   int split;
   unsigned long long *readyCycles;
+  unsigned long long *startCycles;
+  unsigned long long *endCycles;
 };
 
-std::vector<NcclSignalTimeline> nccl_signal_timelines;
+std::vector<PendingNcclSignalTimeline> nccl_signal_timelines;
 std::mutex nccl_signal_events_mutex;
 
 bool
@@ -86,7 +88,7 @@ nccl_signal_debug(int rank, const char *message) {
 void
 nccl_signal_timeline_push(int rank, torch::Tensor ready_cycles) {
   std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
-  nccl_signal_timelines.push_back(NcclSignalTimeline{rank, ready_cycles});
+  nccl_signal_timelines.push_back(PendingNcclSignalTimeline{rank, ready_cycles});
 }
 
 ncclComm_t
@@ -121,8 +123,8 @@ make_byte_storage(size_t nbytes) {
 
 }  // namespace
 
-std::vector<uint64_t>
-consume_nccl_signal_ready_cycles(int rank) {
+NcclSignalTimeline
+consume_nccl_signal_timeline(int rank) {
   torch::Tensor ready_cycles_storage;
   {
     std::lock_guard<std::mutex> lock(nccl_signal_events_mutex);
@@ -130,7 +132,7 @@ consume_nccl_signal_ready_cycles(int rank) {
       if (iter->rank != rank) {
         continue;
       }
-      ready_cycles_storage = iter->ready_cycles;
+      ready_cycles_storage = iter->timeline;
       nccl_signal_timelines.erase(iter);
       break;
     }
@@ -139,9 +141,10 @@ consume_nccl_signal_ready_cycles(int rank) {
     return {};
   }
   auto ready_cycles_cpu = ready_cycles_storage.cpu();
-  auto *ready_cycles = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
-  int n_data_chunks = static_cast<int>(ready_cycles_storage.nbytes() / sizeof(uint64_t));
-  return std::vector<uint64_t>(ready_cycles, ready_cycles + n_data_chunks);
+  auto *timeline = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
+  int n_data_chunks = static_cast<int>(ready_cycles_storage.nbytes() / sizeof(uint64_t)) - 2;
+  return NcclSignalTimeline{
+      timeline[0], timeline[1], std::vector<uint64_t>(timeline + 2, timeline + 2 + n_data_chunks)};
 }
 
 NcclSignalAllGather::NcclSignalAllGather(std::shared_ptr<Group> group)
@@ -191,6 +194,9 @@ NcclSignalAllGather::run(
 
   uint64_t profile_launch_id = this->profile_launch_id_++;
 
+  const bool timeline_profile =
+      ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
+      ag_timeline_profile_launch_selected(profile_launch_id);
   AgEventTimer total_timer("nccl_signal_run_total", group_->get_rank(), stream);
 
   {
@@ -201,12 +207,10 @@ NcclSignalAllGather::run(
         counter_storage_.nbytes(),
         stream));
   }
-  const bool timeline_profile =
-      ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
-      ag_timeline_profile_launch_selected(profile_launch_id);
   if (timeline_profile) {
-    if (!ready_cycles_storage_.defined()) {
-      ready_cycles_storage_ = make_byte_storage(sizeof(uint64_t) * group_->get_size());
+    if (!ready_cycles_storage_.defined() ||
+        ready_cycles_storage_.numel() < static_cast<int64_t>(group_->get_size() + 2)) {
+      ready_cycles_storage_ = make_byte_storage(sizeof(uint64_t) * (group_->get_size() + 2));
     }
     CUDA_CHECK(cudaMemsetAsync(
         ready_cycles_storage_.data_ptr(),
@@ -222,7 +226,13 @@ NcclSignalAllGather::run(
       .launchSignal = nullptr,
       .split = 1,
       .readyCycles = timeline_profile
+          ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 2
+          : nullptr,
+      .startCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr())
+          : nullptr,
+      .endCycles = timeline_profile
+          ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 1
           : nullptr,
   };
 

@@ -20,12 +20,14 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <vector>
 #include <cuda_runtime_api.h>
 
 #include "coll/ths_op/all_gather_types.h"
+#include "coll/ths_op/ag_event_profiler.h"
 #include "ag_gemm/ths_op/nccl_signal_all_gather.h"
 #include "flux/args/ag_gemm.h"
 #include "flux/cuda/cuda_stub.h"
@@ -43,6 +45,8 @@ namespace {
 
 struct GWBRecordedEvent {
   int rank;
+  const char *mode;
+  uint64_t launch_id;
   const char *name;
   cudaEvent_t start;
   cudaEvent_t stop;
@@ -108,7 +112,8 @@ gwb_event_record(cudaEvent_t event, cudaStream_t stream) {
 
 inline void
 gwb_event_push(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop) {
-  g_gwb_events.push_back(GWBRecordedEvent{rank, name, start, stop});
+  g_gwb_events.push_back(GWBRecordedEvent{
+      rank, ths_op::ag_profile_mode(), ths_op::ag_profile_launch_id(), name, start, stop});
 }
 
 inline std::string
@@ -222,10 +227,13 @@ flush_gwb_events_after_sync() {
   for (auto &e : g_gwb_events) {
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, e.start, e.stop));
-    std::cout << "[GWB EVENT] rank=" << e.rank
-              << " name=" << e.name
-              << " ms=" << ms
-              << std::endl;
+    std::ostringstream line;
+    line << "[GWB EVENT] rank=" << e.rank
+         << " mode=" << e.mode
+         << " launch=" << e.launch_id
+         << " name=" << e.name
+         << " ms=" << ms << '\n';
+    ths_op::ag_profile_append(line.str());
     CUDA_CHECK(cudaEventDestroy(e.start));
     CUDA_CHECK(cudaEventDestroy(e.stop));
   }
@@ -408,7 +416,7 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
   int32_t *tile_count = nullptr;
   int64_t *wait_enter = nullptr;
   int64_t *wait_exit = nullptr;
-  std::vector<uint64_t> nccl_ready_cycles;
+  ths_op::NcclSignalTimeline nccl_timeline;
   uint64_t launch_id = this->prof_current_launch_id;
 
   int n_data_chunks = 0;
@@ -429,7 +437,7 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
     wait_exit = wait_exit_cpu.data_ptr<int64_t>();
     n_data_chunks = static_cast<int>(this->prof_wait_enter_cycles_buffer.numel());
     if constexpr (::bytedance::flux::kAGGemmSplit == 1) {
-      nccl_ready_cycles = ths_op::consume_nccl_signal_ready_cycles(this->rank);
+      nccl_timeline = ths_op::consume_nccl_signal_timeline(this->rank);
     }
   }
 
@@ -439,7 +447,21 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
     n_data_chunks = static_cast<int>(this->prof_wait_max_cycles_buffer.numel());
   }
 
-  const char *profile_mode = nccl_ready_cycles.empty() ? "native" : "nccl_signal";
+  const char *profile_mode = nccl_timeline.ready.empty() ? "native" : "nccl_signal";
+  if (!nccl_timeline.ready.empty()) {
+    std::ostringstream line;
+    line << "[AG NCCL TIMELINE] rank=" << this->rank
+         << " mode=" << profile_mode
+         << " launch=" << launch_id
+         << " start_globaltimer=" << nccl_timeline.start
+         << " end_globaltimer=" << nccl_timeline.end
+         << " duration_globaltimer="
+         << (nccl_timeline.end >= nccl_timeline.start
+                 ? nccl_timeline.end - nccl_timeline.start
+                 : 0)
+         << '\n';
+    ths_op::ag_profile_append(line.str());
+  }
   std::ostringstream profile_output;
   for (int i = 0; i < n_data_chunks; ++i) {
     if (wait_count != nullptr && (wait_count[i] != 0 || tile_count[i] != 0)) {
@@ -457,7 +479,7 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
                      << '\n';
     }
     if (wait_enter != nullptr && (wait_enter[i] != 0 || wait_exit[i] != 0)) {
-      uint64_t ready = i < static_cast<int>(nccl_ready_cycles.size()) ? nccl_ready_cycles[i] : 0;
+      uint64_t ready = i < static_cast<int>(nccl_timeline.ready.size()) ? nccl_timeline.ready[i] : 0;
       uint64_t enter = static_cast<uint64_t>(wait_enter[i]);
       uint64_t exit = static_cast<uint64_t>(wait_exit[i]);
       uint64_t sampled_wait = exit >= enter ? exit - enter : 0;
@@ -478,9 +500,34 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
     }
   }
   std::string output = profile_output.str();
+  if (wait_cycles != nullptr || wait_enter != nullptr) {
+    uint64_t total_wait = 0;
+    uint64_t max_wait = 0;
+    uint64_t total_waits = 0;
+    for (int i = 0; i < n_data_chunks; ++i) {
+      if (wait_cycles != nullptr) {
+        total_wait += static_cast<uint64_t>(wait_cycles[i]);
+        total_waits += static_cast<uint64_t>(wait_count[i]);
+      } else if (wait_enter[i] != 0 && wait_exit[i] >= wait_enter[i]) {
+        total_wait += static_cast<uint64_t>(wait_exit[i] - wait_enter[i]);
+        total_waits += 1;
+      }
+      if (wait_max_cycles != nullptr) {
+        max_wait = std::max(max_wait, static_cast<uint64_t>(wait_max_cycles[i]));
+      }
+    }
+    std::ostringstream line;
+    line << "[AG GEMM WAIT] rank=" << this->rank
+         << " mode=" << profile_mode
+         << " launch=" << launch_id
+         << " unit=globaltimer_ticks"
+         << " total_wait=" << total_wait
+         << " max_wait=" << max_wait
+         << " waits=" << total_waits << '\n';
+    ths_op::ag_profile_append(line.str());
+  }
   if (!output.empty()) {
-    std::fwrite(output.data(), 1, output.size(), stdout);
-    std::fflush(stdout);
+    ths_op::ag_profile_append(std::move(output));
   }
 }
 

@@ -145,10 +145,13 @@ agk_event_print(int rank, const char *name, cudaEvent_t start, cudaEvent_t stop)
   float ms = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
-  std::cout << "[AGK EVENT] rank=" << rank
-            << " name=" << name
-            << " ms=" << ms
-            << std::endl;
+  std::ostringstream line;
+  line << "[AGK EVENT] rank=" << rank
+       << " mode=" << ag_profile_mode()
+       << " launch=" << ag_profile_launch_id()
+       << " name=" << name
+       << " ms=" << ms << '\n';
+  ag_profile_append(line.str());
 }
 
 inline std::string
@@ -248,6 +251,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
 
   bool use_pdl;  // sm90 feature
   bool disable_nccl_signal_for_profiling = false;
+  uint64_t profile_launch_id = 0;
 
  private:
   AllGatherOption
@@ -405,6 +409,14 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> gathered_input,
       c10::optional<UnifiedGemmHParams> const &hparams,
       cudaStream_t stream) {
+    int rank = this->tp_group->get_rank();
+    bool use_nccl_signal =
+        ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
+    const char *mode = use_nccl_signal
+        ? (ag_nccl_signal_wait_enabled() ? "nccl_signal_wait" : "nccl_signal_fused")
+        : "native";
+    AgEventProfilerScope profile_scope(mode, rank, profile_launch_id++);
+
     if (!ag_nccl_signal_enabled() && use_pdl && opt.use_cuda_core_ag) {
       return forward_with_pdl_impl(
           input,
@@ -647,6 +659,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
               gathered_copy_stop);
         }
       }
+
+      ag_profile_flush();
 
       agk_event_destroy(fwd_start);
       agk_event_destroy(fwd_stop);

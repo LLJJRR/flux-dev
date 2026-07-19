@@ -54,6 +54,12 @@ class NcclSignalAllGather {
   uint64_t profile_launch_id_ = 0;
 };
 
-std::vector<uint64_t> consume_nccl_signal_ready_cycles(int rank);
+struct NcclSignalTimeline {
+  uint64_t start;
+  uint64_t end;
+  std::vector<uint64_t> ready;
+};
+
+NcclSignalTimeline consume_nccl_signal_timeline(int rank);
 
 }  // namespace bytedance::flux::ths_op
