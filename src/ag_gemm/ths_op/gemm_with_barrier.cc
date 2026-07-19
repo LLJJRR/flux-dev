@@ -447,7 +447,9 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
     n_data_chunks = static_cast<int>(this->prof_wait_max_cycles_buffer.numel());
   }
 
-  const char *profile_mode = nccl_timeline.ready.empty() ? "native" : "nccl_signal";
+  const char *profile_mode = ths_op::ag_profile_context_active()
+      ? ths_op::ag_profile_mode()
+      : (nccl_timeline.ready.empty() ? "native" : "nccl_signal");
   if (!nccl_timeline.ready.empty()) {
     std::ostringstream line;
     line << "[AG NCCL TIMELINE] rank=" << this->rank
@@ -579,7 +581,10 @@ GemmWithBarirer::forward(
     c10::optional<UnifiedGemmHParams> const &hparams,
     int32_t *producer_signal,
     cudaStream_t stream) {
-  this->prof_current_launch_id = this->prof_next_launch_id++;
+  uint64_t local_launch_id = this->prof_next_launch_id++;
+  this->prof_current_launch_id = ths_op::ag_profile_context_active()
+      ? ths_op::ag_profile_launch_id()
+      : local_launch_id;
   this->prof_timeline_active =
       ag_timeline_profile_enabled_for_rank(this->rank) &&
       ag_timeline_profile_launch_selected(this->prof_current_launch_id);

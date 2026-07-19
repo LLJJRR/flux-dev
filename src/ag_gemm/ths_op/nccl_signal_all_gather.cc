@@ -192,7 +192,10 @@ NcclSignalAllGather::run(
     return;
   }
 
-  uint64_t profile_launch_id = this->profile_launch_id_++;
+  uint64_t local_launch_id = this->profile_launch_id_++;
+  uint64_t profile_launch_id = ag_profile_context_active()
+      ? ag_profile_launch_id()
+      : local_launch_id;
 
   const bool timeline_profile =
       ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&

@@ -37,6 +37,8 @@ struct FluxNcclSignalLayout {
   int *launchSignal;
   int split;
   unsigned long long *readyCycles;
+  unsigned long long *startCycles;
+  unsigned long long *endCycles;
 };
 
 bool
@@ -151,6 +153,8 @@ NcclSignalReduceScatter::run(
       .launchSignal = nullptr,
       .split = 1,
       .readyCycles = nullptr,
+      .startCycles = nullptr,
+      .endCycles = nullptr,
   };
 
   CUDA_CHECK(cudaMemcpyAsync(

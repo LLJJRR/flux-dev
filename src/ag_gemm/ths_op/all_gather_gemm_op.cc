@@ -386,6 +386,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       ::bytedance::flux::flush_gwb_events_after_sync();
 
       agk_event_print(rank, "AGK_gemm_only_total", gemm_only_start, gemm_only_stop);
+      ag_profile_flush();
 
       agk_event_destroy(gemm_only_start);
       agk_event_destroy(gemm_only_stop);
@@ -660,8 +661,6 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         }
       }
 
-      ag_profile_flush();
-
       agk_event_destroy(fwd_start);
       agk_event_destroy(fwd_stop);
       agk_event_destroy(cp_ag_start);
@@ -673,6 +672,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_destroy(gathered_copy_start);
       agk_event_destroy(gathered_copy_stop);
     }
+
+    // Wait/timeline profiling may not create CUDA events, but its dump path
+    // has already synchronized and appended records to the pending output.
+    ag_profile_flush();
 
     return result;
   }
