@@ -19,6 +19,7 @@
 
 #include "coll/ths_op/ag_event_profiler.h"
 #include "flux/cuda/cuda_common.h"
+#include "flux/cuda/cuda_stub.h"
 #include "flux/flux.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -41,15 +42,9 @@ struct PendingNcclSignalTimeline {
   int nranks;
 };
 
-struct FluxNcclSignalLayout {
-  int *barrier;
-  int *counters;
-  int *launchSignal;
-  int split;
-  unsigned long long *readyCycles;
-  unsigned long long *startCycles;
-  unsigned long long *endCycles;
-};
+using FluxNcclSignalLayout = ncclFluxAgSignal_t;
+
+constexpr int kFluxAgPreReadyMagic = 0x46580000;
 
 std::vector<PendingNcclSignalTimeline> nccl_signal_timelines;
 std::mutex nccl_signal_events_mutex;
@@ -57,6 +52,11 @@ std::mutex nccl_signal_events_mutex;
 bool
 nccl_signal_debug_enabled() {
   return std::getenv("FLUX_AG_NCCL_DEBUG") != nullptr;
+}
+
+bool
+nccl_signal_inplace_enabled() {
+  return std::getenv("FLUX_AG_NCCL_INPLACE") != nullptr;
 }
 
 bool
@@ -214,6 +214,7 @@ NcclSignalAllGather::run(
   const bool timeline_profile =
       ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
       ag_timeline_profile_launch_selected(profile_launch_id);
+  const bool use_inplace = nccl_signal_inplace_enabled();
   AgEventTimer total_timer("nccl_signal_run_total", group_->get_rank(), stream);
 
   {
@@ -236,12 +237,36 @@ NcclSignalAllGather::run(
         stream));
   }
 
+  const void *nccl_input = input;
+  if (use_inplace) {
+    FLUX_CHECK_LE(group_->get_rank(), 0xffff)
+        << "FLUX_AG_NCCL_INPLACE supports ranks representable by the signal token";
+    auto *local_input = static_cast<uint8_t *>(input_buffer) +
+        static_cast<size_t>(group_->get_rank()) * bytes_per_rank;
+    if (local_input != input) {
+      AgEventTimer timer("inplace_local_copy", group_->get_rank(), stream);
+      CUDA_CHECK(cudaMemcpyAsync(
+          local_input, input, bytes_per_rank, cudaMemcpyDeviceToDevice, stream));
+    }
+    {
+      AgEventTimer timer("inplace_local_ready", group_->get_rank(), stream);
+      CU_CHECK(CUStreamWriteValue(
+          stream,
+          reinterpret_cast<CUdeviceptr>(static_cast<int *>(barrier_buffer) + group_->get_rank()),
+          1,
+          CU_STREAM_WRITE_VALUE_DEFAULT));
+    }
+    nccl_input = local_input;
+  }
+
   nccl_signal_debug(group_->get_rank(), "signal cudaMemcpyAsync begin");
   FluxNcclSignalLayout signal = {
       .barrier = static_cast<int *>(barrier_buffer),
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
       .split = 1,
+      .preReadyRankToken =
+          use_inplace ? kFluxAgPreReadyMagic | group_->get_rank() : 0,
       .readyCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 2
           : nullptr,
@@ -268,7 +293,7 @@ NcclSignalAllGather::run(
     AgEventTimer timer("ncclAllGatherFluxSignal_total", group_->get_rank(), stream);
     nccl_signal_debug(group_->get_rank(), "ncclAllGatherFluxSignal begin");
     NCCL_CHECK(ncclAllGatherFluxSignal(
-        input,
+        nccl_input,
         input_buffer,
         bytes_per_rank,
         ncclInt8,

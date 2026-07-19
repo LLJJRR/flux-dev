@@ -31,15 +31,7 @@ namespace bytedance::flux::ths_op {
 
 namespace {
 
-struct FluxNcclSignalLayout {
-  int *barrier;
-  int *counters;
-  int *launchSignal;
-  int split;
-  unsigned long long *readyCycles;
-  unsigned long long *startCycles;
-  unsigned long long *endCycles;
-};
+using FluxNcclSignalLayout = ncclFluxAgSignal_t;
 
 bool
 nccl_signal_debug_enabled() {
@@ -152,6 +144,7 @@ NcclSignalReduceScatter::run(
       .counters = static_cast<int *>(counter_storage_.data_ptr()),
       .launchSignal = nullptr,
       .split = 1,
+      .preReadyRankToken = 0,
       .readyCycles = nullptr,
       .startCycles = nullptr,
       .endCycles = nullptr,
