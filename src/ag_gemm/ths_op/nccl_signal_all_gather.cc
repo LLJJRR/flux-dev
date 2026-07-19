@@ -143,6 +143,9 @@ consume_nccl_signal_timeline(int rank) {
   auto ready_cycles_cpu = ready_cycles_storage.cpu();
   auto *timeline = reinterpret_cast<uint64_t *>(ready_cycles_cpu.data_ptr<uint8_t>());
   int n_data_chunks = static_cast<int>(ready_cycles_storage.nbytes() / sizeof(uint64_t)) - 2;
+  if (n_data_chunks <= 0 || timeline[0] == 0) {
+    return {};
+  }
   return NcclSignalTimeline{
       timeline[0], timeline[1], std::vector<uint64_t>(timeline + 2, timeline + 2 + n_data_chunks)};
 }

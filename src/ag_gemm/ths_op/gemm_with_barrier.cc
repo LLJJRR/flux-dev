@@ -449,8 +449,8 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
 
   const char *profile_mode = ths_op::ag_profile_context_active()
       ? ths_op::ag_profile_mode()
-      : (nccl_timeline.ready.empty() ? "native" : "nccl_signal");
-  if (!nccl_timeline.ready.empty()) {
+      : (nccl_timeline.start != 0 ? "nccl_signal" : "native");
+  if (nccl_timeline.start != 0) {
     std::ostringstream line;
     line << "[AG NCCL TIMELINE] rank=" << this->rank
          << " mode=" << profile_mode
@@ -458,9 +458,10 @@ GemmWithBarirer::dump_ag_wait_profile(cudaStream_t stream) {
          << " start_globaltimer=" << nccl_timeline.start
          << " end_globaltimer=" << nccl_timeline.end
          << " duration_globaltimer="
-         << (nccl_timeline.end >= nccl_timeline.start
+         << (nccl_timeline.end >= nccl_timeline.start && nccl_timeline.end != 0
                  ? nccl_timeline.end - nccl_timeline.start
                  : 0)
+         << " status=" << (nccl_timeline.end != 0 ? "complete" : "incomplete")
          << '\n';
     ths_op::ag_profile_append(line.str());
   }

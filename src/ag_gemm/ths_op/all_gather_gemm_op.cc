@@ -392,6 +392,9 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_destroy(gemm_only_stop);
     }
 
+    // Wait/timeline profiling can append output without creating CUDA events.
+    ag_profile_flush();
+
     return result;
   }
 
@@ -732,6 +735,16 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
           gathered_input->nbytes(),
           cudaMemcpyDeviceToDevice,
           stream));
+    }
+    if (ag_event_profile_enabled() ||
+        std::getenv("FLUX_AG_KERNEL_EVENT_PROFILE") != nullptr ||
+        std::getenv("FLUX_GWB_EVENT_PROFILE") != nullptr ||
+        std::getenv("FLUX_AG_WAIT_PROFILE") != nullptr ||
+        std::getenv("FLUX_AG_TIMELINE_PROFILE") != nullptr) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      ::bytedance::flux::flush_gwb_events_after_sync();
+      flush_ag_events_after_sync();
+      ag_profile_flush();
     }
     return output_buf;
   }
