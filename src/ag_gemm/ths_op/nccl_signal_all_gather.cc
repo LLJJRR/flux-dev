@@ -45,6 +45,7 @@ struct PendingNcclSignalTimeline {
 using FluxNcclSignalLayout = ncclFluxAgSignal_t;
 
 constexpr int kFluxAgPreReadyMagic = 0x46580000;
+constexpr int kFluxAgInternalCopyBit = 0x00010000;
 
 std::vector<PendingNcclSignalTimeline> nccl_signal_timelines;
 std::mutex nccl_signal_events_mutex;
@@ -57,6 +58,11 @@ nccl_signal_debug_enabled() {
 bool
 nccl_signal_inplace_enabled() {
   return std::getenv("FLUX_AG_NCCL_INPLACE") != nullptr;
+}
+
+bool
+nccl_signal_internal_copy_enabled() {
+  return std::getenv("FLUX_AG_NCCL_INTERNAL_COPY") != nullptr;
 }
 
 bool
@@ -215,6 +221,13 @@ NcclSignalAllGather::run(
       ag_timeline_profile_enabled_for_rank(group_->get_rank()) &&
       ag_timeline_profile_launch_selected(profile_launch_id);
   const bool use_inplace = nccl_signal_inplace_enabled();
+  const bool use_internal_copy = nccl_signal_internal_copy_enabled();
+  FLUX_CHECK(!(use_inplace && use_internal_copy))
+      << "FLUX_AG_NCCL_INPLACE and FLUX_AG_NCCL_INTERNAL_COPY are mutually exclusive";
+  if (use_inplace || use_internal_copy) {
+    FLUX_CHECK_LE(group_->get_rank(), 0xffff)
+        << "NCCL signal copy modes support ranks representable by the signal token";
+  }
   AgEventTimer total_timer("nccl_signal_run_total", group_->get_rank(), stream);
 
   {
@@ -239,8 +252,6 @@ NcclSignalAllGather::run(
 
   const void *nccl_input = input;
   if (use_inplace) {
-    FLUX_CHECK_LE(group_->get_rank(), 0xffff)
-        << "FLUX_AG_NCCL_INPLACE supports ranks representable by the signal token";
     auto *local_input = static_cast<uint8_t *>(input_buffer) +
         static_cast<size_t>(group_->get_rank()) * bytes_per_rank;
     if (local_input != input) {
@@ -266,7 +277,11 @@ NcclSignalAllGather::run(
       .launchSignal = nullptr,
       .split = 1,
       .preReadyRankToken =
-          use_inplace ? kFluxAgPreReadyMagic | group_->get_rank() : 0,
+          use_inplace
+              ? kFluxAgPreReadyMagic | group_->get_rank()
+              : (use_internal_copy
+                     ? kFluxAgPreReadyMagic | kFluxAgInternalCopyBit | group_->get_rank()
+                     : 0),
       .readyCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 2
           : nullptr,
