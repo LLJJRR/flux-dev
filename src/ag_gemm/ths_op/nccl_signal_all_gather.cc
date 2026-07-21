@@ -46,7 +46,6 @@ using FluxNcclSignalLayout = ncclFluxAgSignal_t;
 
 constexpr int kFluxAgPreReadyMagic = 0x46580000;
 constexpr int kFluxAgInternalCopyBit = 0x00010000;
-constexpr int kFluxAgInternalCopyOptBit = 0x00020000;
 
 std::vector<PendingNcclSignalTimeline> nccl_signal_timelines;
 std::mutex nccl_signal_events_mutex;
@@ -64,11 +63,6 @@ nccl_signal_inplace_enabled() {
 bool
 nccl_signal_internal_copy_enabled() {
   return std::getenv("FLUX_AG_NCCL_INTERNAL_COPY") != nullptr;
-}
-
-bool
-nccl_signal_internal_copy_opt_enabled() {
-  return std::getenv("FLUX_AG_NCCL_INTERNAL_COPY_OPT") != nullptr;
 }
 
 bool
@@ -228,14 +222,9 @@ NcclSignalAllGather::run(
       ag_timeline_profile_launch_selected(profile_launch_id);
   const bool use_inplace = nccl_signal_inplace_enabled();
   const bool use_internal_copy = nccl_signal_internal_copy_enabled();
-  const bool use_internal_copy_opt = nccl_signal_internal_copy_opt_enabled();
-  const int selected_copy_modes =
-      static_cast<int>(use_inplace) + static_cast<int>(use_internal_copy) +
-      static_cast<int>(use_internal_copy_opt);
-  FLUX_CHECK_LE(selected_copy_modes, 1)
-      << "FLUX_AG_NCCL_INPLACE, FLUX_AG_NCCL_INTERNAL_COPY, and "
-         "FLUX_AG_NCCL_INTERNAL_COPY_OPT are mutually exclusive";
-  if (use_inplace || use_internal_copy || use_internal_copy_opt) {
+  FLUX_CHECK(!(use_inplace && use_internal_copy))
+      << "FLUX_AG_NCCL_INPLACE and FLUX_AG_NCCL_INTERNAL_COPY are mutually exclusive";
+  if (use_inplace || use_internal_copy) {
     FLUX_CHECK_LE(group_->get_rank(), 0xffff)
         << "NCCL signal copy modes support ranks representable by the signal token";
   }
@@ -292,10 +281,7 @@ NcclSignalAllGather::run(
               ? kFluxAgPreReadyMagic | group_->get_rank()
               : (use_internal_copy
                      ? kFluxAgPreReadyMagic | kFluxAgInternalCopyBit | group_->get_rank()
-                     : (use_internal_copy_opt
-                            ? kFluxAgPreReadyMagic | kFluxAgInternalCopyOptBit |
-                                group_->get_rank()
-                            : 0)),
+                     : 0),
       .readyCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 2
           : nullptr,
