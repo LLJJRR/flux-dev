@@ -48,6 +48,21 @@ class PerfResult:
         )
 
 
+class OverlapPerfResult:
+    def __init__(self, name: str, output: torch.Tensor, gemm_ms: float, total_ms: float):
+        self.name = name
+        self.output = output
+        self.gemm_time_ms = gemm_ms
+        self.comm_time_ms = total_ms - gemm_ms
+        self.total_ms = total_ms
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.name}: isolated_split_gemm {self.gemm_time_ms:.3f} ms, "
+            f"overlapped_total {self.total_ms:.3f} ms, delta {self.comm_time_ms:.3f} ms"
+        )
+
+
 def benchmark_barrier() -> None:
     torch.cuda.synchronize()
     try:
@@ -216,16 +231,17 @@ def tune_flused_gemm_only(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     group: dist.ProcessGroup,
+    name: str = "full",
 ) -> None:
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
     full_output = torch.empty((input.size(0), weight.size(0)), dtype=input.dtype, device=input.device)
     gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
     if rank == 0:
-        print("[NCCL-SIGNAL-RS] start Flused GemmOnly tuning")
+        print(f"[NCCL-SIGNAL-RS] start Flused GemmOnly tuning ({name})")
     global_k = input.size(1) * world_size
     prof_ctx = flux.ProfilingContext(
-        f"nccl_signal_rs_gemm_only_M{input.size(0)}_N{weight.size(0)}_K{global_k}"
+        f"nccl_signal_rs_gemm_only_{name}_M{input.size(0)}_N{weight.size(0)}_K{global_k}"
     )
     _ = gemm_only.profiling(
         input,
@@ -238,7 +254,7 @@ def tune_flused_gemm_only(
     benchmark_barrier()
     if rank == 0:
         print(prof_ctx.get_latest_prof_result())
-        print("[NCCL-SIGNAL-RS] finish Flused GemmOnly tuning")
+        print(f"[NCCL-SIGNAL-RS] finish Flused GemmOnly tuning ({name})")
 
 
 @torch.no_grad()
@@ -282,6 +298,84 @@ def perf_flux_nccl_signal_rs(
     return PerfResult(f"flux_nccl_signal_rs #{rank}", output, gemm_ms / iters, comm_ms / iters)
 
 
+@torch.no_grad()
+def perf_flux_nccl_overlap_rs(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    warmup: int,
+    iters: int,
+    group: dist.ProcessGroup,
+) -> OverlapPerfResult:
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    if world_size != 2:
+        raise ValueError("--overlap-rank-split currently requires TP2")
+
+    m_per_rank = input.size(0) // world_size
+    full_output = torch.empty((input.size(0), weight.size(0)), dtype=input.dtype, device=input.device)
+    output = torch.empty((m_per_rank, weight.size(0)), dtype=input.dtype, device=input.device)
+    gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
+    nccl_rs = flux_mod.NcclSignalReduceScatter(group)
+    segment_order = (1 - rank, rank)
+
+    def run_split_gemm() -> None:
+        for segment in segment_order:
+            begin = segment * m_per_rank
+            segment_input = input.narrow(0, begin, m_per_rank)
+            segment_bias = None if bias is None else bias.narrow(0, begin, m_per_rank)
+            segment_output = full_output.narrow(0, begin, m_per_rank)
+            gemm_only.forward(
+                segment_input,
+                weight,
+                bias=segment_bias,
+                output_buf=segment_output,
+            )
+
+    def run_overlap() -> None:
+        nccl_rs.start_overlap(full_output, output)
+        for segment in segment_order:
+            begin = segment * m_per_rank
+            segment_input = input.narrow(0, begin, m_per_rank)
+            segment_bias = None if bias is None else bias.narrow(0, begin, m_per_rank)
+            segment_output = full_output.narrow(0, begin, m_per_rank)
+            gemm_only.forward(
+                segment_input,
+                weight,
+                bias=segment_bias,
+                output_buf=segment_output,
+            )
+            nccl_rs.mark_ready(segment)
+        nccl_rs.finish_overlap()
+
+    benchmark_barrier()
+    for _ in range(warmup):
+        run_split_gemm()
+    benchmark_barrier()
+    gemm_start = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    gemm_end = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        gemm_start[i].record()
+        run_split_gemm()
+        gemm_end[i].record()
+    torch.cuda.synchronize()
+    gemm_ms = sum(gemm_start[i].elapsed_time(gemm_end[i]) for i in range(iters)) / iters
+
+    benchmark_barrier()
+    for _ in range(warmup):
+        run_overlap()
+    benchmark_barrier()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        start_events[i].record()
+        run_overlap()
+        end_events[i].record()
+    torch.cuda.synchronize()
+    total_ms = sum(start_events[i].elapsed_time(end_events[i]) for i in range(iters)) / iters
+    return OverlapPerfResult(f"flux_nccl_overlap_rs #{rank}", output, gemm_ms, total_ms)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("M", type=int, nargs="?", default=2048)
@@ -296,6 +390,7 @@ def parse_args():
     parser.add_argument("--tune-gemm-rs", action="store_true")
     parser.add_argument("--tune-gemm-only", action="store_true")
     parser.add_argument("--compare-flused-only", action="store_true")
+    parser.add_argument("--overlap-rank-split", action="store_true")
     parser.add_argument("--flux-rs-ring-mode", choices=("ring1d", "ring2d"))
     parser.add_argument("--primitive-only", action="store_true")
     return parser.parse_args()
@@ -311,6 +406,13 @@ def main():
         raise RuntimeError(
             "Flux extension was built without the NcclSignalReduceScatter binding; "
             "rebuild the Flux extension before running this test"
+        )
+    if args.overlap_rank_split and not hasattr(
+        flux_mod.NcclSignalReduceScatter, "start_overlap"
+    ):
+        raise RuntimeError(
+            "Flux extension was built without NCCL ReduceScatter overlap support; "
+            "rebuild NCCL and the Flux extension before running this test"
         )
     if args.primitive_only:
         rank = int(os.environ.get("RANK", 0))
@@ -354,6 +456,15 @@ def main():
 
     if args.tune_gemm_only:
         tune_flused_gemm_only(input, weight, bias, tp_group)
+        if args.overlap_rank_split:
+            split_m = args.M // world_size
+            tune_flused_gemm_only(
+                input.narrow(0, 0, split_m),
+                weight,
+                None if bias is None else bias.narrow(0, 0, split_m),
+                tp_group,
+                name="rank_split",
+            )
 
     perf_torch_res = perf_torch(input, weight, bias, args.warmup, args.iters, tp_group)
     perf_flux_res = None
@@ -377,6 +488,16 @@ def main():
         args.iters,
         tp_group,
     )
+    perf_overlap_res = None
+    if args.overlap_rank_split:
+        perf_overlap_res = perf_flux_nccl_overlap_rs(
+            input,
+            weight,
+            bias,
+            args.warmup,
+            args.iters,
+            tp_group,
+        )
 
     if rank == 0:
         flux.testing.print_gemm_sol_time(args.M, args.N, local_k, dtype)
@@ -384,6 +505,8 @@ def main():
     results = [perf_torch_res, perf_signal_res]
     if perf_flux_res is not None:
         results.insert(1, perf_flux_res)
+    if perf_overlap_res is not None:
+        results.append(perf_overlap_res)
     for result in results:
         for i in range(world_size):
             if i == rank:
@@ -398,10 +521,15 @@ def main():
         flux_output = perf_flux_res.output.reshape(torch_output.shape)
         torch.testing.assert_close(flux_output, torch_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(signal_output, torch_output, atol=atol, rtol=rtol)
+    if perf_overlap_res is not None:
+        overlap_output = perf_overlap_res.output.reshape(torch_output.shape)
+        torch.testing.assert_close(overlap_output, torch_output, atol=atol, rtol=rtol)
 
     if perf_flux_res is not None:
         print("✅ flux_rs check passed")
     print("✅ flux_nccl_signal_rs check passed")
+    if perf_overlap_res is not None:
+        print("✅ flux_nccl_overlap_rs check passed")
     tp_group.barrier()
     if rank == 0:
         print("[NCCL-SIGNAL-RS] all checks passed")

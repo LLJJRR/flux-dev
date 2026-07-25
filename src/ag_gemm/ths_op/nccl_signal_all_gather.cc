@@ -291,6 +291,9 @@ NcclSignalAllGather::run(
       .endCycles = timeline_profile
           ? static_cast<unsigned long long *>(ready_cycles_storage_.data_ptr()) + 1
           : nullptr,
+      .producerReady = nullptr,
+      .launchCounter = nullptr,
+      .producerEpoch = 0,
   };
 
   {

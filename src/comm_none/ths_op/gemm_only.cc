@@ -24,6 +24,7 @@
 #include "flux/op_registry.h"
 #include "flux/ths_op/ths_op.h"
 #include "flux/ths_op/util.h"
+#include "flux/utils.h"
 #include <ATen/core/jit_type.h>
 #include <ATen/core/List.h>
 #include <ATen/core/TensorBody.h>
@@ -35,6 +36,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/intrusive_ptr.h>
 #include <cuda_runtime_api.h>
+#include <iostream>
+#include <sstream>
 #include <utility>
 
 namespace bytedance {
@@ -50,7 +53,9 @@ class GemmOnly::GemmOnlyImpl {
   const bool transpose_weight;
   const bool use_fp8_gemm;
   const bool use_s8_gemm;
+  const bool log_hparams_enabled;
   torch::Tensor gemm_buffer;
+  bool logged_hparams = false;
 
  private:
   auto
@@ -170,12 +175,20 @@ class GemmOnly::GemmOnlyImpl {
     }
 
     auto meta = get_gemm_meta(/*has_bias=*/bias.has_value(), /*fast_accum=*/fast_accum);
-    OpRegistry::OpPtr gemm_op;
+    UnifiedGemmHParams selected_hparams =
+        hparams.has_value() ? hparams.value()
+                            : OpRegistry::instance().get_hparams(meta, rt_conf);
+    OpRegistry::OpPtr gemm_op = OpRegistry::instance().get_op(meta, selected_hparams);
 
-    if (hparams.has_value()) {
-      gemm_op = OpRegistry::instance().get_op(meta, hparams.value());
-    } else {
-      gemm_op = OpRegistry::instance().get_op(meta, rt_conf);
+    if (!hparams.has_value() && !logged_hparams && log_hparams_enabled) {
+      bool config_hit = TuningConfigRegistry::instance().get(meta, rt_conf) != nullptr;
+      std::ostringstream os;
+      os << "[FLUX_GEMM_ONLY_HPARAMS] rank=" << get_int_from_env("RANK", 0)
+         << " source=" << (config_hit ? "tuning_config" : "heuristic_fallback")
+         << " meta=" << meta << " runtime=" << rt_conf
+         << " hparams=" << selected_hparams;
+      std::cerr << os.str() << '\n';
+      logged_hparams = true;
     }
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -274,7 +287,8 @@ class GemmOnly::GemmOnlyImpl {
         output_dtype(output_dtype),
         transpose_weight(transpose_weight),
         use_fp8_gemm(is_fp8_torch_dtype(input_dtype) && use_fp8_gemm),
-        use_s8_gemm(is_s8_dtype(from_torch_dtype(input_dtype))) {
+        use_s8_gemm(is_s8_dtype(from_torch_dtype(input_dtype))),
+        log_hparams_enabled(get_bool_from_env("FLUX_GEMM_ONLY_LOG_HPARAMS", false)) {
     FLUX_CHECK(!(transpose_weight == true && use_fp8_gemm == true))
         << "FP8 GEMM does not support transpose weight";
   }

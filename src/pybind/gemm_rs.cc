@@ -132,7 +132,39 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
             },
             py::arg("input"),
             py::arg("output"),
-            py::arg("emit_signal") = true);
+            py::arg("emit_signal") = true)
+        .def(
+            "start_overlap",
+            [](NcclSignalReduceScatter &self,
+               torch::Tensor input,
+               torch::Tensor output) {
+              FLUX_CHECK(input.is_cuda());
+              FLUX_CHECK(output.is_cuda());
+              FLUX_CHECK(input.is_contiguous());
+              FLUX_CHECK(output.is_contiguous());
+              FLUX_CHECK_EQ(input.scalar_type(), output.scalar_type());
+              FLUX_CHECK_EQ(input.numel(), output.numel() * self.group_size());
+              auto stream = at::cuda::getCurrentCUDAStream().stream();
+              self.start_overlap(
+                  input.data_ptr(),
+                  output.data_ptr(),
+                  output.numel(),
+                  to_nccl_dtype(output.scalar_type()),
+                  stream);
+            },
+            py::arg("input"),
+            py::arg("output"))
+        .def(
+            "mark_ready",
+            [](NcclSignalReduceScatter &self, int rank_segment) {
+              self.mark_ready(rank_segment, at::cuda::getCurrentCUDAStream().stream());
+            },
+            py::arg("rank_segment"))
+        .def(
+            "finish_overlap",
+            [](NcclSignalReduceScatter &self) {
+              self.finish_overlap(at::cuda::getCurrentCUDAStream().stream());
+            });
 
     m.def(
         "test_nccl_signal_reduce_scatter",

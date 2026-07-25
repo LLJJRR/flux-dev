@@ -47,11 +47,27 @@ class NcclSignalReduceScatter {
       cudaStream_t stream,
       bool emit_signal = true);
 
+  void start_overlap(
+      const void *input,
+      void *output,
+      size_t count_per_rank,
+      ncclDataType_t datatype,
+      cudaStream_t compute_stream);
+  void mark_ready(int rank_segment, cudaStream_t compute_stream);
+  void finish_overlap(cudaStream_t compute_stream);
+
  private:
   std::shared_ptr<Group> group_;
   ncclComm_t nccl_comm_ = nullptr;
   torch::Tensor signal_storage_;
   torch::Tensor counter_storage_;
+  torch::Tensor launch_signal_storage_;
+  torch::Tensor launch_counter_storage_;
+  torch::Tensor producer_ready_storage_;
+  cudaStream_t comm_stream_ = nullptr;
+  cudaEvent_t completion_event_ = nullptr;
+  int producer_epoch_ = 0;
+  bool overlap_active_ = false;
 };
 
 }  // namespace bytedance::flux::ths_op
