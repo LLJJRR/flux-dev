@@ -162,7 +162,18 @@ def perf_flux_rs(
     if tune:
         if rank == 0:
             print("[NCCL-SIGNAL-RS] start original Flux GemmRS tuning")
-        _ = op.profiling(input, weight, bias=bias, reduce_scatter_option=option)
+        global_k = input.size(1) * dist.get_world_size(group)
+        prof_ctx = flux.ProfilingContext(
+            f"nccl_signal_rs_tune_M{input.size(0)}_N{weight.size(0)}_K{global_k}"
+        )
+        _ = op.profiling(
+            input,
+            weight,
+            bias=bias,
+            prof_ctx=prof_ctx,
+            reduce_scatter_option=option,
+        )
+        flux.load_tuning_record(prof_ctx.get_latest_record())
         benchmark_barrier()
         if rank == 0:
             print("[NCCL-SIGNAL-RS] finish original Flux GemmRS tuning")
