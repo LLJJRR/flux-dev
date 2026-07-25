@@ -26,7 +26,7 @@ import torch.distributed as dist
 
 import flux
 import flux.testing
-from flux.cpp_mod import ReduceScatterOption
+from flux.cpp_mod import ReduceScatterOption, flux_mod
 from flux.testing import DTYPE_MAP, generate_data, initialize_distributed
 from flux.testing.perf_db_helper import log_perf
 
@@ -76,7 +76,7 @@ def run_primitive_case(process_group: dist.ProcessGroup, m: int, n: int) -> None
     recv_shape = (m, n)
     input = _primitive_rank_pattern(rank, world_size, recv_shape)
     output = torch.empty(recv_shape, device="cuda", dtype=torch.float32)
-    nccl_rs = flux.NcclSignalReduceScatter(process_group)
+    nccl_rs = flux_mod.NcclSignalReduceScatter(process_group)
 
     for name, emit_signal in (("standard", False), ("signal", True)):
         if rank == 0:
@@ -225,7 +225,7 @@ def perf_flux_nccl_signal_rs(
     full_output = torch.empty((input.size(0), weight.size(0)), dtype=input.dtype, device=input.device)
     output = torch.empty((input.size(0) // world_size, weight.size(0)), dtype=input.dtype, device=input.device)
     gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
-    nccl_rs = flux.NcclSignalReduceScatter(group)
+    nccl_rs = flux_mod.NcclSignalReduceScatter(group)
 
     benchmark_barrier()
     for _ in range(warmup):
@@ -270,6 +270,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not hasattr(flux_mod, "NcclSignalReduceScatter"):
+        raise RuntimeError(
+            "Flux extension was built without the NcclSignalReduceScatter binding; "
+            "rebuild the Flux extension before running this test"
+        )
     if args.primitive_only:
         rank = int(os.environ.get("RANK", 0))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))

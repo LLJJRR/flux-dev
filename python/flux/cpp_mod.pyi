@@ -168,6 +168,22 @@ class ReduceScatterOption:
     num_blocks: Optional[int]
     ring_mode: Optional[RingMode]
 
+class NcclSignalReduceScatter:
+    def __init__(self, process_group: dist.ProcessGroup) -> None: ...
+    def run(
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        emit_signal: bool = True,
+    ) -> None: ...
+
+def test_nccl_signal_reduce_scatter(
+    process_group: dist.ProcessGroup,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    emit_signal: bool = True,
+) -> None: ...
+
 class A2ARingMode(Enum):
     All2All = ...
     Ring1D = ...

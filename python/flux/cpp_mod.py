@@ -126,6 +126,8 @@ GemmGroupedV3 = _get_flux_member("GemmGroupedV3")
 
 # GEMM+RS
 GemmRS = _get_flux_member("GemmRS")
+NcclSignalReduceScatter = _get_flux_member("NcclSignalReduceScatter")
+test_nccl_signal_reduce_scatter = _get_flux_member("test_nccl_signal_reduce_scatter")
 get_gemm_rs_threadblock_segments_info = _get_flux_member("get_gemm_rs_threadblock_segments_info")
 calc_gemm_rs_threadblock_segments_info = _get_flux_member("calc_gemm_rs_threadblock_segments_info")
 GemmRSInterNode = _get_flux_member("GemmRSInterNode")
@@ -213,6 +215,8 @@ __all__ = [
     "ReduceScatterOption",
     "RingMode",
     "GemmRS",
+    "NcclSignalReduceScatter",
+    "test_nccl_signal_reduce_scatter",
     "GemmRSInterNode",
     "AGKernel",
     "AGKernelInterNode",
