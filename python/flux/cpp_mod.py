@@ -145,14 +145,14 @@ ReduceScatterOption = _get_flux_member("ReduceScatterOption")
 if not isinstance(ReduceScatterOption, NotCompiled):
     ReduceScatterOption.__repr__ = (
         lambda x: f"use_barrier_queue={x.use_barrier_queue}, "
-        "use_1d_ring={x.use_1d_ring}, "
-        "use_p2p_read={x.use_p2p_read}, "
-        "use_cudaMemcpyAsync={x.use_cudaMemcpyAsync}, "
-        "use_gemmk={x.use_gemmk}, "
-        "per_tile_flags={x.per_tile_flags}, "
-        "n_split={x.n_split}, "
-        "num_blocks={x.num_blocks}, "
-        "ring_mode={x.ring_mode}"
+        f"use_1d_ring={x.use_1d_ring}, "
+        f"use_p2p_read={x.use_p2p_read}, "
+        f"use_cudaMemcpyAsync={x.use_cudaMemcpyAsync}, "
+        f"use_gemmk={x.use_gemmk}, "
+        f"per_tile_flags={x.per_tile_flags}, "
+        f"n_split={x.n_split}, "
+        f"num_blocks={x.num_blocks}, "
+        f"ring_mode={x.ring_mode}"
     )
 
 # AG+GEMM
