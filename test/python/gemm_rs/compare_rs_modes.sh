@@ -3,18 +3,20 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 FLUX_DIR=$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)
-LOG_DIR=${FLUX_RS_COMPARE_LOG_DIR:-"${FLUX_DIR}/test/python/gemm_rs/logs"}
 
 M=${FLUX_RS_COMPARE_M:-2048}
-N=${FLUX_RS_COMPARE_N:-49152}
-K=${FLUX_RS_COMPARE_K:-12288}
+N=${FLUX_RS_COMPARE_N:-12288}
+K=${FLUX_RS_COMPARE_K:-49152}
 DTYPE=${FLUX_RS_COMPARE_DTYPE:-bfloat16}
-WARMUP=${FLUX_RS_COMPARE_WARMUP:-5}
-ITERS=${FLUX_RS_COMPARE_ITERS:-20}
+LOG_DIR=${FLUX_RS_COMPARE_LOG_DIR:-"${FLUX_DIR}/test/python/gemm_rs/logs/M${M}_N${N}_K${K}_${DTYPE}"}
+WARMUP=${FLUX_RS_COMPARE_WARMUP:-20}
+ITERS=${FLUX_RS_COMPARE_ITERS:-100}
 TUNE=${FLUX_RS_COMPARE_TUNE:-1}
+BLOCKS=${FLUX_RS_COMPARE_BLOCKS:-"4 6 8 12"}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 
 mkdir -p "${LOG_DIR}"
+read -r -a BLOCK_VALUES <<< "${BLOCKS}"
 
 GPU_COUNT=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
 if [[ "${GPU_COUNT}" -lt 2 && "${FLUX_RS_COMPARE_ALLOW_SINGLE_GPU:-0}" != "1" ]]; then
@@ -66,7 +68,7 @@ run_case_args() {
   echo "log: ${log_file}"
   (
     cd "${FLUX_DIR}"
-    env FLUX_RS_DEBUG="${FLUX_RS_DEBUG:-1}" ./launch.sh "${COMMON_ARGS[@]}" "$@"
+    env -u FLUX_RS_DEBUG ./launch.sh "${COMMON_ARGS[@]}" "$@"
   ) 2>&1 | tee "${log_file}"
 }
 
@@ -79,11 +81,39 @@ run_case_args "rs_ring1d" --ring_mode=ring1d
 
 run_case_args "rs_ring2d" --ring_mode=ring2d
 
+run_case_args "rs_p2p_write" --no-use_p2p_read
+
 run_case_args "rs_cudaMemcpyAsync" --use_cudaMemcpyAsync
 
 run_case_args "rs_gemmk_per_tile" --use_gemmk --per_tile_flags
 
+run_case_args "rs_fuse_reduction" --fuse_reduction
+
+for blocks in "${BLOCK_VALUES[@]}"; do
+  run_case_args \
+    "rs_p2p_read_blocks_${blocks}" \
+    --use_p2p_read \
+    --reduce_scatter_blocks="${blocks}"
+
+  run_case_args \
+    "rs_gemmk_per_tile_blocks_${blocks}" \
+    --use_gemmk \
+    --per_tile_flags \
+    --reduce_scatter_blocks="${blocks}"
+done
+
 echo
 echo "Logs are under ${LOG_DIR}"
 echo "Best hparams summary:"
-grep -h "best_hparams=" "${LOG_DIR}"/*.log 2>/dev/null || true
+for log_file in "${LOG_DIR}"/*.log; do
+  [[ -f "${log_file}" ]] || continue
+  grep "best_hparams=" "${log_file}" 2>/dev/null | sed "s|^|$(basename "${log_file}"): |" || true
+done
+
+echo
+echo "Per-rank performance summary:"
+for log_file in "${LOG_DIR}"/*.log; do
+  [[ -f "${log_file}" ]] || continue
+  grep -E "^(torch|flux) #[0-9]+:" "${log_file}" 2>/dev/null \
+    | sed "s|^|$(basename "${log_file}"): |" || true
+done
