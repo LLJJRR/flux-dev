@@ -144,6 +144,7 @@ def perf_flux_rs(
     group: dist.ProcessGroup,
     nnodes: int,
     tune: bool,
+    option: ReduceScatterOption,
 ) -> PerfResult:
     rank = dist.get_rank(group)
     op = flux.GemmRS(
@@ -157,8 +158,6 @@ def perf_flux_rs(
         False,
         False,
     )
-    option = ReduceScatterOption()
-
     if tune:
         if rank == 0:
             print("[NCCL-SIGNAL-RS] start original Flux GemmRS tuning")
@@ -255,8 +254,8 @@ def perf_flux_nccl_signal_rs(
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("M", type=int, nargs="?", default=2048)
-    parser.add_argument("N", type=int, nargs="?", default=49152)
-    parser.add_argument("K", type=int, nargs="?", default=12288)
+    parser.add_argument("N", type=int, nargs="?", default=12288)
+    parser.add_argument("K", type=int, nargs="?", default=49152)
     parser.add_argument("--m", type=int, help="primitive-only receive M")
     parser.add_argument("--n", type=int, help="primitive-only receive N")
     parser.add_argument("--dtype", default="bfloat16", choices=("float16", "bfloat16", "float32"))
@@ -264,6 +263,7 @@ def parse_args():
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--has_bias", action="store_true")
     parser.add_argument("--tune-gemm-rs", action="store_true")
+    parser.add_argument("--flux-rs-ring-mode", choices=("ring1d", "ring2d"))
     parser.add_argument("--primitive-only", action="store_true")
     return parser.parse_args()
 
@@ -308,9 +308,24 @@ def main():
     ]
     input, weight, bias = next(generate_data(data_config))
 
+    flux_rs_option = ReduceScatterOption()
+    if args.flux_rs_ring_mode is not None:
+        flux_rs_option.ring_mode = {
+            "ring1d": flux.RingMode.Ring1D,
+            "ring2d": flux.RingMode.Ring2D,
+        }[args.flux_rs_ring_mode]
+
     perf_torch_res = perf_torch(input, weight, bias, args.warmup, args.iters, tp_group)
     perf_flux_res = perf_flux_rs(
-        input, weight, bias, args.warmup, args.iters, tp_group, nnodes, args.tune_gemm_rs
+        input,
+        weight,
+        bias,
+        args.warmup,
+        args.iters,
+        tp_group,
+        nnodes,
+        args.tune_gemm_rs,
+        flux_rs_option,
     )
     perf_signal_res = perf_flux_nccl_signal_rs(input, weight, bias, args.warmup, args.iters, tp_group)
 
@@ -336,6 +351,7 @@ def main():
     tp_group.barrier()
     if rank == 0:
         print("[NCCL-SIGNAL-RS] all checks passed")
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

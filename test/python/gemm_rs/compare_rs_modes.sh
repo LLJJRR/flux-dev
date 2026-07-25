@@ -141,6 +141,6 @@ echo
 echo "Per-rank performance summary:"
 for log_file in "${LOG_DIR}"/*.log; do
   [[ -f "${log_file}" ]] || continue
-  grep -E "^(torch|flux) #[0-9]+:" "${log_file}" 2>/dev/null \
+  grep -E "^(torch|flux[^ ]*) #[0-9]+:" "${log_file}" 2>/dev/null \
     | sed "s|^|$(basename "${log_file}"): |" || true
 done
