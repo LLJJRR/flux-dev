@@ -211,6 +211,37 @@ def perf_flux_rs(
 
 
 @torch.no_grad()
+def tune_flused_gemm_only(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    group: dist.ProcessGroup,
+) -> None:
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    full_output = torch.empty((input.size(0), weight.size(0)), dtype=input.dtype, device=input.device)
+    gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
+    if rank == 0:
+        print("[NCCL-SIGNAL-RS] start Flused GemmOnly tuning")
+    global_k = input.size(1) * world_size
+    prof_ctx = flux.ProfilingContext(
+        f"nccl_signal_rs_gemm_only_M{input.size(0)}_N{weight.size(0)}_K{global_k}"
+    )
+    _ = gemm_only.profiling(
+        input,
+        weight,
+        bias=bias,
+        output_buf=full_output,
+        prof_ctx=prof_ctx,
+    )
+    flux.load_tuning_record(prof_ctx.get_latest_record())
+    benchmark_barrier()
+    if rank == 0:
+        print(prof_ctx.get_latest_prof_result())
+        print("[NCCL-SIGNAL-RS] finish Flused GemmOnly tuning")
+
+
+@torch.no_grad()
 def perf_flux_nccl_signal_rs(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -263,6 +294,8 @@ def parse_args():
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--has_bias", action="store_true")
     parser.add_argument("--tune-gemm-rs", action="store_true")
+    parser.add_argument("--tune-gemm-only", action="store_true")
+    parser.add_argument("--compare-flused-only", action="store_true")
     parser.add_argument("--flux-rs-ring-mode", choices=("ring1d", "ring2d"))
     parser.add_argument("--primitive-only", action="store_true")
     return parser.parse_args()
@@ -270,6 +303,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.compare_flused_only and (args.tune_gemm_rs or args.flux_rs_ring_mode is not None):
+        raise ValueError(
+            "--tune-gemm-rs and --flux-rs-ring-mode only apply when native Flux RS is enabled"
+        )
     if not hasattr(flux_mod, "NcclSignalReduceScatter"):
         raise RuntimeError(
             "Flux extension was built without the NcclSignalReduceScatter binding; "
@@ -315,24 +352,39 @@ def main():
             "ring2d": flux.RingMode.Ring2D,
         }[args.flux_rs_ring_mode]
 
+    if args.tune_gemm_only:
+        tune_flused_gemm_only(input, weight, bias, tp_group)
+
     perf_torch_res = perf_torch(input, weight, bias, args.warmup, args.iters, tp_group)
-    perf_flux_res = perf_flux_rs(
+    perf_flux_res = None
+    if not args.compare_flused_only:
+        perf_flux_res = perf_flux_rs(
+            input,
+            weight,
+            bias,
+            args.warmup,
+            args.iters,
+            tp_group,
+            nnodes,
+            args.tune_gemm_rs,
+            flux_rs_option,
+        )
+    perf_signal_res = perf_flux_nccl_signal_rs(
         input,
         weight,
         bias,
         args.warmup,
         args.iters,
         tp_group,
-        nnodes,
-        args.tune_gemm_rs,
-        flux_rs_option,
     )
-    perf_signal_res = perf_flux_nccl_signal_rs(input, weight, bias, args.warmup, args.iters, tp_group)
 
     if rank == 0:
         flux.testing.print_gemm_sol_time(args.M, args.N, local_k, dtype)
 
-    for result in (perf_torch_res, perf_flux_res, perf_signal_res):
+    results = [perf_torch_res, perf_signal_res]
+    if perf_flux_res is not None:
+        results.insert(1, perf_flux_res)
+    for result in results:
         for i in range(world_size):
             if i == rank:
                 log_perf(result)
@@ -341,12 +393,14 @@ def main():
     atol = 2e-2 if dtype == torch.bfloat16 else 1e-2
     rtol = atol
     torch_output = perf_torch_res.output
-    flux_output = perf_flux_res.output.reshape(torch_output.shape)
     signal_output = perf_signal_res.output.reshape(torch_output.shape)
-    torch.testing.assert_close(flux_output, torch_output, atol=atol, rtol=rtol)
+    if perf_flux_res is not None:
+        flux_output = perf_flux_res.output.reshape(torch_output.shape)
+        torch.testing.assert_close(flux_output, torch_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(signal_output, torch_output, atol=atol, rtol=rtol)
 
-    print("✅ flux_rs check passed")
+    if perf_flux_res is not None:
+        print("✅ flux_rs check passed")
     print("✅ flux_nccl_signal_rs check passed")
     tp_group.barrier()
     if rank == 0:
