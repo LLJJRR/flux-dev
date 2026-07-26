@@ -74,6 +74,7 @@ class PerfResult:
         gemm_time_ms: float,
         scatter_time_ms: float,
         comm_time_ms: float,
+        fused: bool = False,
     ) -> None:
         self.name = name
         self.outputs = outputs
@@ -82,12 +83,16 @@ class PerfResult:
         self.scatter_time_ms = scatter_time_ms
         self.comm_time_ms = comm_time_ms
         self.total_ms = self.gemm_time_ms + self.scatter_time_ms + self.comm_time_ms
+        self.fused = fused
 
     def __repr__(self) -> str:
+        if self.fused:
+            return f"{self.name}: total {self.total_ms:.3f} ms"
         return (
             f"{self.name}: gemm {self.gemm_time_ms:.3f} ms"
             f", scatter {self.scatter_time_ms:.3f} ms"
             f", comm {self.comm_time_ms:.3f} ms"
+            f", total {self.total_ms:.3f} ms"
         )
 
 
@@ -206,6 +211,7 @@ def perf_triton(
         gemm_time_ms=gemm_time_ms,
         scatter_time_ms=0.0,
         comm_time_ms=0.0,
+        fused=True,
     )
 
 
@@ -300,13 +306,15 @@ def perf_flux(
 
     gemm_time_ms = sum(gemm_times) / iters
 
+    flux_name = "flux_nccl_signal" if os.getenv("FLUX_MOE_AG_NCCL_SIGNAL") else "flux"
     return PerfResult(
-        name=f"flux #{TP_GROUP.rank()}",
+        name=f"{flux_name} #{TP_GROUP.rank()}",
         outputs=ctx.get_outputs_clone(),
         gathered_input=gathered_input,
         gemm_time_ms=gemm_time_ms,
         scatter_time_ms=0.0,
         comm_time_ms=0.0,
+        fused=True,
     )
 
 

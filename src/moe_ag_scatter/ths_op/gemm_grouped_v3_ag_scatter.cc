@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "moe_ag_scatter/ths_op/gemm_grouped_v3_ag_scatter.h"
+#include "ag_gemm/ths_op/nccl_signal_all_gather.h"
 #include "cute/tensor.hpp"
 #include "cutlass/util/device_memory.h"
 #include "flux/cuda/cuda_common.h"
@@ -45,7 +46,10 @@
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/Optional.h>
 #include <cuda_runtime_api.h>
+#include <cstdlib>
+#include <memory>
 #include <nvshmemx.h>
+#include <string>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/cuda.h>
 
@@ -82,6 +86,30 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
   cudaEvent_t ready_event;
   cudaEvent_t fetch_remote_event;
   cudaEvent_t all_gather_event;
+  std::shared_ptr<Group> nccl_group;
+  std::unique_ptr<NcclSignalAllGather> nccl_signal_ag;
+
+  bool
+  use_nccl_signal_ag() const {
+    return std::getenv("FLUX_MOE_AG_NCCL_SIGNAL") != nullptr;
+  }
+
+  void
+  check_nccl_signal_ag_support() const {
+    FLUX_CHECK_EQ(tp_env.world_size, 2)
+        << "FLUX_MOE_AG_NCCL_SIGNAL currently supports TP2 only";
+    FLUX_CHECK_EQ(tp_env.ep_size, 1)
+        << "FLUX_MOE_AG_NCCL_SIGNAL currently supports EP1 only";
+    FLUX_CHECK_EQ(tp_env.nnodes, 1)
+        << "FLUX_MOE_AG_NCCL_SIGNAL currently supports single-node execution only";
+
+    auto const *algo = std::getenv("NCCL_ALGO");
+    auto const *proto = std::getenv("NCCL_PROTO");
+    FLUX_CHECK(algo != nullptr && std::string(algo) == "Ring")
+        << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_ALGO=Ring";
+    FLUX_CHECK(proto != nullptr && std::string(proto) == "Simple")
+        << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_PROTO=Simple";
+  }
 
   void
   init_buffers() {
@@ -126,6 +154,8 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
   }
 
   ~GemmGroupedV3AGScatterOpImpl() {
+    this->nccl_signal_ag.reset();
+    this->nccl_group.reset();
     CUDA_CHECK(cudaEventDestroy(this->all_gather_event));
     CUDA_CHECK(cudaEventDestroy(this->fetch_remote_event));
     CUDA_CHECK(cudaEventDestroy(this->ready_event));
@@ -224,6 +254,30 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
   }
 
+  void
+  all_gather_nccl_signal(torch::Tensor const &inputs_shard) {
+    check_nccl_signal_ag_support();
+    FLUX_CHECK_LE(inputs_shard.nbytes() * tp_env.world_size, input_buffer.nbytes())
+        << "NCCL signal MoE AllGather input exceeds the rank-major input buffer";
+
+    if (nccl_signal_ag == nullptr) {
+      nccl_group = std::make_shared<C10dProcessGroup>("moe_ag_nccl_signal", tp_env.tp_group);
+      nccl_signal_ag = std::make_unique<NcclSignalAllGather>(nccl_group);
+    }
+
+    auto main_stream = c10::cuda::getCurrentCUDAStream();
+    CUDA_CHECK(cudaEventRecord(this->ready_event, main_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream_intra_node, this->ready_event));
+    nccl_signal_ag->run(
+        inputs_shard.data_ptr(),
+        input_buffer.data_ptr(),
+        barrier_block.get(),
+        inputs_shard.nbytes(),
+        this->cp_stream_intra_node,
+        true);
+    CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
+  }
+
   std::vector<torch::Tensor>
   forward_impl(
       torch::Tensor inputs_shard,
@@ -287,8 +341,13 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
       CUDA_CHECK(cudaMemsetAsync(barrier_block.get(), 0, barrier_block.bytes()));
     }
 
-    // Step 2: Launch Allgather copies
-    this->all_gather_all2all(inputs_shard);
+    // Step 2: Launch AllGather. Both producers publish barrier[src_rank] when
+    // that rank's full input shard is ready for the existing GEMM fetcher.
+    if (use_nccl_signal_ag()) {
+      this->all_gather_nccl_signal(inputs_shard);
+    } else {
+      this->all_gather_all2all(inputs_shard);
+    }
 
     // Step 3: helper kernels. for preparing gather_index & sort tokens & outputs
     std::vector<torch::Tensor> outputs;
