@@ -215,14 +215,7 @@ def perf_triton(
     )
 
 
-@torch.no_grad()
-def perf_flux(
-    ctx: MoeMlp1Ctx,
-    warmup_iters: int,
-    iters: int,
-    gather_input: bool = True,
-    ag_option: flux.AllGatherOption = flux.AllGatherOption(),
-):
+def create_flux_op(ctx: MoeMlp1Ctx):
     tp_env = flux.DistEnvTPWithEP(tp_group=TP_GROUP, nnodes=DIST_ENV.NNODES, ep_group=EP_GROUP)
     moe_args = flux.MoeArguments(
         max_ntokens=ctx.b * ctx.s,
@@ -233,12 +226,25 @@ def perf_flux(
         input_dtype=ctx.inputs_shard.dtype,
         output_dtype=ctx.outputs[0].dtype,
     )
+    if flux.util.get_arch() >= 90:
+        return flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
+    return flux.GemmGroupedV2AGScatterOp(tp_env=tp_env, moe_args=moe_args)
+
+
+@torch.no_grad()
+def perf_flux(
+    ctx: MoeMlp1Ctx,
+    warmup_iters: int,
+    iters: int,
+    gather_input: bool = True,
+    ag_option: flux.AllGatherOption = flux.AllGatherOption(),
+    op=None,
+):
+    if op is None:
+        op = create_flux_op(ctx)
 
     extra_args = {}
-    if flux.util.get_arch() >= 90:
-        op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
-    else:
-        op = flux.GemmGroupedV2AGScatterOp(tp_env=tp_env, moe_args=moe_args)
+    if flux.util.get_arch() < 90:
         extra_args = {
             "ag_option": ag_option,
         }
@@ -306,7 +312,12 @@ def perf_flux(
 
     gemm_time_ms = sum(gemm_times) / iters
 
-    flux_name = "flux_nccl_signal" if os.getenv("FLUX_MOE_AG_NCCL_SIGNAL") else "flux"
+    if os.getenv("FLUX_MOE_AG_NCCL_SIGNAL"):
+        flux_name = (
+            "flux_nccl_wait" if os.getenv("FLUX_MOE_AG_NCCL_WAIT") else "flux_nccl_signal"
+        )
+    else:
+        flux_name = "flux"
     return PerfResult(
         name=f"{flux_name} #{TP_GROUP.rank()}",
         outputs=ctx.get_outputs_clone(),
@@ -399,6 +410,12 @@ def parse_args():
     )
     parser.add_argument("--tune", default=False, action="store_true", help="find best GemmHParams")
     parser.add_argument(
+        "--compare-nccl-wait",
+        default=False,
+        action="store_true",
+        help="compare full NCCL wait against source-rank signal overlap with one tuned config",
+    )
+    parser.add_argument(
         "--gather_input",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -440,6 +457,13 @@ OUT_DTYPE_MAP = {
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.compare_nccl_wait:
+        assert not args.triton_only, "--compare-nccl-wait is incompatible with --triton-only"
+        assert DIST_ENV.WORLD_SIZE == 2, "--compare-nccl-wait currently requires TP2"
+        assert args.E == 1, "--compare-nccl-wait currently requires EP1"
+        assert flux.util.get_arch() >= 90, "--compare-nccl-wait requires the SM90 MoE path"
+        os.environ["FLUX_MOE_AG_NCCL_SIGNAL"] = "1"
+        os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
     init_ep_group(args.E)
 
     print("before flux_shm initialization")
@@ -510,13 +534,49 @@ if __name__ == "__main__":
         group=TP_GROUP,
     ):
         if not args.triton_only:
-            perf_result_flux = perf_flux(
-                moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option
-            )
+            if args.compare_nccl_wait:
+                shared_flux_op = create_flux_op(moe_ctx)
+                os.environ["FLUX_MOE_AG_NCCL_WAIT"] = "1"
+                perf_result_flux_wait = perf_flux(
+                    moe_ctx,
+                    args.warmup_iters,
+                    args.iters,
+                    args.gather_input,
+                    ag_option,
+                    shared_flux_op,
+                )
+                os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
+                perf_result_flux = perf_flux(
+                    moe_ctx,
+                    args.warmup_iters,
+                    args.iters,
+                    args.gather_input,
+                    ag_option,
+                    shared_flux_op,
+                )
+            else:
+                perf_result_flux = perf_flux(
+                    moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option
+                )
         perf_result_torch = perf_torch(moe_ctx, args.warmup_iters, args.iters, args.gather_input)
         if args.triton:
             perf_result_triton = perf_triton(
                 moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option=ag_option
+            )
+
+    if args.compare_nccl_wait:
+        ab_totals = torch.tensor(
+            [perf_result_flux_wait.total_ms, perf_result_flux.total_ms],
+            dtype=torch.float64,
+            device=moe_ctx.inputs_shard.device,
+        )
+        torch.distributed.all_reduce(ab_totals, op=torch.distributed.ReduceOp.MAX, group=TP_GROUP)
+        if TP_GROUP.rank() == 0:
+            wait_ms, signal_ms = ab_totals.cpu().tolist()
+            gain = (wait_ms - signal_ms) / wait_ms * 100.0
+            print(
+                f"[MOE-NCCL-OVERLAP] wait={wait_ms:.3f} ms, "
+                f"signal={signal_ms:.3f} ms, gain={gain:.2f}%"
             )
 
     if TP_GROUP.rank() == 0:
@@ -531,6 +591,8 @@ if __name__ == "__main__":
         set_global_args("moe_ag_scatter", args)
     flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_torch))
     if not args.triton_only:
+        if args.compare_nccl_wait:
+            flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux_wait))
         flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux))
     if args.triton:
         flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_triton))
@@ -571,8 +633,19 @@ if __name__ == "__main__":
                 print(f"✅ {name_x} check passed")
 
     if not args.triton_only:
+        if args.compare_nccl_wait:
+            flux.exec_in_rank_order(
+                TP_GROUP,
+                lambda: check_result(
+                    perf_result_flux_wait, perf_result_torch, "flux_nccl_wait", "torch"
+                ),
+            )
+        flux_result_name = "flux_nccl_signal" if args.compare_nccl_wait else "flux"
         flux.exec_in_rank_order(
-            TP_GROUP, lambda: check_result(perf_result_flux, perf_result_torch, "flux", "torch")
+            TP_GROUP,
+            lambda: check_result(
+                perf_result_flux, perf_result_torch, flux_result_name, "torch"
+            ),
         )
     if args.triton:
         flux.exec_in_rank_order(

@@ -94,6 +94,11 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     return std::getenv("FLUX_MOE_AG_NCCL_SIGNAL") != nullptr;
   }
 
+  bool
+  wait_for_nccl_signal_ag() const {
+    return std::getenv("FLUX_MOE_AG_NCCL_WAIT") != nullptr;
+  }
+
   void
   check_nccl_signal_ag_support() const {
     FLUX_CHECK_EQ(tp_env.world_size, 2)
@@ -482,6 +487,11 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
 
     if (tp_env.nnodes > 1) {
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->fetch_remote_event));
+    }
+    // A/B baseline: keep helper work overlapped, but serialize GEMM behind the
+    // same NCCL AllGather used by the source-rank signal path.
+    if (use_nccl_signal_ag() && wait_for_nccl_signal_ag()) {
+      CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
     }
     // Step 5: launch GEMM
     if (args.problem_count > 0) {
