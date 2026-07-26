@@ -239,6 +239,7 @@ def perf_flux(
     gather_input: bool = True,
     ag_option: flux.AllGatherOption = flux.AllGatherOption(),
     op=None,
+    capture_output: bool = True,
 ):
     if op is None:
         op = create_flux_op(ctx)
@@ -320,8 +321,8 @@ def perf_flux(
         flux_name = "flux"
     return PerfResult(
         name=f"{flux_name} #{TP_GROUP.rank()}",
-        outputs=ctx.get_outputs_clone(),
-        gathered_input=gathered_input,
+        outputs=ctx.get_outputs_clone() if capture_output else [],
+        gathered_input=gathered_input if capture_output else None,
         gemm_time_ms=gemm_time_ms,
         scatter_time_ms=0.0,
         comm_time_ms=0.0,
@@ -536,24 +537,61 @@ if __name__ == "__main__":
         if not args.triton_only:
             if args.compare_nccl_wait:
                 shared_flux_op = create_flux_op(moe_ctx)
-                os.environ["FLUX_MOE_AG_NCCL_WAIT"] = "1"
-                perf_result_flux_wait = perf_flux(
-                    moe_ctx,
-                    args.warmup_iters,
-                    args.iters,
-                    args.gather_input,
-                    ag_option,
-                    shared_flux_op,
-                )
-                os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
-                perf_result_flux = perf_flux(
-                    moe_ctx,
-                    args.warmup_iters,
-                    args.iters,
-                    args.gather_input,
-                    ag_option,
-                    shared_flux_op,
-                )
+
+                def set_flux_mode(mode: str):
+                    if mode == "flux":
+                        os.environ.pop("FLUX_MOE_AG_NCCL_SIGNAL", None)
+                        os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
+                    elif mode == "wait":
+                        os.environ["FLUX_MOE_AG_NCCL_SIGNAL"] = "1"
+                        os.environ["FLUX_MOE_AG_NCCL_WAIT"] = "1"
+                    else:
+                        assert mode == "signal"
+                        os.environ["FLUX_MOE_AG_NCCL_SIGNAL"] = "1"
+                        os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
+
+                mode_times = {"flux": [], "wait": [], "signal": []}
+                for mode in ("flux", "wait", "signal", "signal", "wait", "flux"):
+                    set_flux_mode(mode)
+                    timing = perf_flux(
+                        moe_ctx,
+                        args.warmup_iters,
+                        args.iters,
+                        args.gather_input,
+                        ag_option,
+                        shared_flux_op,
+                        capture_output=False,
+                    )
+                    mode_times[mode].append(timing.total_ms)
+
+                captured_results = {}
+                for mode in ("flux", "wait", "signal"):
+                    set_flux_mode(mode)
+                    captured_results[mode] = perf_flux(
+                        moe_ctx,
+                        0,
+                        1,
+                        args.gather_input,
+                        ag_option,
+                        shared_flux_op,
+                    )
+
+                def averaged_result(mode: str):
+                    captured = captured_results[mode]
+                    total_ms = sum(mode_times[mode]) / len(mode_times[mode])
+                    return PerfResult(
+                        name=captured.name,
+                        outputs=captured.outputs,
+                        gathered_input=captured.gathered_input,
+                        gemm_time_ms=total_ms,
+                        scatter_time_ms=0.0,
+                        comm_time_ms=0.0,
+                        fused=True,
+                    )
+
+                perf_result_flux_native = averaged_result("flux")
+                perf_result_flux_wait = averaged_result("wait")
+                perf_result_flux = averaged_result("signal")
             else:
                 perf_result_flux = perf_flux(
                     moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option
@@ -566,17 +604,26 @@ if __name__ == "__main__":
 
     if args.compare_nccl_wait:
         ab_totals = torch.tensor(
-            [perf_result_flux_wait.total_ms, perf_result_flux.total_ms],
+            [
+                perf_result_flux_native.total_ms,
+                perf_result_flux_wait.total_ms,
+                perf_result_flux.total_ms,
+            ],
             dtype=torch.float64,
             device=moe_ctx.inputs_shard.device,
         )
         torch.distributed.all_reduce(ab_totals, op=torch.distributed.ReduceOp.MAX, group=TP_GROUP)
         if TP_GROUP.rank() == 0:
-            wait_ms, signal_ms = ab_totals.cpu().tolist()
+            flux_ms, wait_ms, signal_ms = ab_totals.cpu().tolist()
             gain = (wait_ms - signal_ms) / wait_ms * 100.0
+            signal_vs_flux = (flux_ms - signal_ms) / flux_ms * 100.0
             print(
                 f"[MOE-NCCL-OVERLAP] wait={wait_ms:.3f} ms, "
                 f"signal={signal_ms:.3f} ms, gain={gain:.2f}%"
+            )
+            print(
+                f"[MOE-COMM-COMPARE] flux={flux_ms:.3f} ms, wait={wait_ms:.3f} ms, "
+                f"signal={signal_ms:.3f} ms, signal_vs_flux={signal_vs_flux:.2f}%"
             )
 
     if TP_GROUP.rank() == 0:
@@ -592,6 +639,7 @@ if __name__ == "__main__":
     flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_torch))
     if not args.triton_only:
         if args.compare_nccl_wait:
+            flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux_native))
             flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux_wait))
         flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux))
     if args.triton:
@@ -634,6 +682,12 @@ if __name__ == "__main__":
 
     if not args.triton_only:
         if args.compare_nccl_wait:
+            flux.exec_in_rank_order(
+                TP_GROUP,
+                lambda: check_result(
+                    perf_result_flux_native, perf_result_torch, "flux", "torch"
+                ),
+            )
             flux.exec_in_rank_order(
                 TP_GROUP,
                 lambda: check_result(
