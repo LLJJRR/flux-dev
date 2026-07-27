@@ -21,6 +21,7 @@
 #include "gemm_rs/ths_op/gemm_reduce_scatter.h"
 #include "gemm_rs/ths_op/helper_ops.h"
 #include "gemm_rs/ths_op/nccl_signal_reduce_scatter.h"
+#include "gemm_rs/ths_op/moe_gather_rs_nccl.h"
 #include "gemm_rs/tile_scheduler/threadblock_swizzle_segment_util.hpp"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -97,6 +98,32 @@ test_nccl_signal_reduce_scatter(
 
 static int _register_gemm_rs_ops [[maybe_unused]] = []() {
   ThsOpsInitRegistry::instance().register_one("gemm_reduce_scatter", [](py::module &m) {
+    py::class_<MoeGatherRSNccl>(m, "MoeGatherRSNccl")
+        .def(py::init([](c10::intrusive_ptr<c10d::ProcessGroup> pg,
+                         torch::Tensor weight,
+                         int64_t num_experts,
+                         int64_t topk,
+                         int64_t n_split) {
+          return new MoeGatherRSNccl(
+              std::make_shared<C10dProcessGroup>("moe_gather_rs_nccl", pg),
+              std::move(weight),
+              num_experts,
+              topk,
+              n_split);
+        }),
+        py::arg("process_group"),
+        py::arg("weight"),
+        py::arg("num_experts"),
+        py::arg("topk"),
+        py::arg("n_split") = 2)
+        .def(
+            "forward",
+            &MoeGatherRSNccl::forward,
+            py::arg("input"),
+            py::arg("splits_cpu"),
+            py::arg("routing_idx"),
+            py::arg("row_scale"));
+
     py::class_<NcclSignalReduceScatter>(m, "NcclSignalReduceScatter")
         .def(py::init([](c10::intrusive_ptr<c10d::ProcessGroup> pg) {
           return new NcclSignalReduceScatter(std::make_shared<C10dProcessGroup>("", pg));
@@ -114,17 +141,20 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
               FLUX_CHECK_EQ(input.scalar_type(), output.scalar_type());
               FLUX_CHECK_EQ(input.numel(), output.numel() * self.group_size());
 
-              std::vector<int64_t> barrier_shape = {static_cast<int64_t>(self.group_size())};
-              auto barrier = at::zeros(
-                  barrier_shape,
-                  output.options()
-                      .device(output.device())
-                      .dtype(torch::kInt32));
+              torch::Tensor barrier;
+              if (emit_signal) {
+                std::vector<int64_t> barrier_shape = {static_cast<int64_t>(self.group_size())};
+                barrier = at::zeros(
+                    barrier_shape,
+                    output.options()
+                        .device(output.device())
+                        .dtype(torch::kInt32));
+              }
               auto stream = at::cuda::getCurrentCUDAStream().stream();
               self.run(
                   input.data_ptr(),
                   output.data_ptr(),
-                  barrier.data_ptr(),
+                  emit_signal ? barrier.data_ptr() : nullptr,
                   output.numel(),
                   to_nccl_dtype(output.scalar_type()),
                   stream,
@@ -137,7 +167,8 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
             "start_overlap",
             [](NcclSignalReduceScatter &self,
                torch::Tensor input,
-               torch::Tensor output) {
+               torch::Tensor output,
+               int split) {
               FLUX_CHECK(input.is_cuda());
               FLUX_CHECK(output.is_cuda());
               FLUX_CHECK(input.is_contiguous());
@@ -150,16 +181,20 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
                   output.data_ptr(),
                   output.numel(),
                   to_nccl_dtype(output.scalar_type()),
+                  split,
                   stream);
             },
             py::arg("input"),
-            py::arg("output"))
+            py::arg("output"),
+            py::arg("split") = 1)
         .def(
             "mark_ready",
-            [](NcclSignalReduceScatter &self, int rank_segment) {
-              self.mark_ready(rank_segment, at::cuda::getCurrentCUDAStream().stream());
+            [](NcclSignalReduceScatter &self, int rank_segment, int split_idx) {
+              self.mark_ready(
+                  rank_segment, split_idx, at::cuda::getCurrentCUDAStream().stream());
             },
-            py::arg("rank_segment"))
+            py::arg("rank_segment"),
+            py::arg("split_idx") = 0)
         .def(
             "finish_overlap",
             [](NcclSignalReduceScatter &self) {

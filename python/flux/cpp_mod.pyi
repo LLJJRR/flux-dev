@@ -176,9 +176,26 @@ class NcclSignalReduceScatter:
         output: torch.Tensor,
         emit_signal: bool = True,
     ) -> None: ...
-    def start_overlap(self, input: torch.Tensor, output: torch.Tensor) -> None: ...
-    def mark_ready(self, rank_segment: int) -> None: ...
+    def start_overlap(self, input: torch.Tensor, output: torch.Tensor, split: int = 1) -> None: ...
+    def mark_ready(self, rank_segment: int, split_idx: int = 0) -> None: ...
     def finish_overlap(self) -> None: ...
+
+class MoeGatherRSNccl:
+    def __init__(
+        self,
+        process_group: dist.ProcessGroup,
+        weight: torch.Tensor,
+        num_experts: int,
+        topk: int,
+        n_split: int = 2,
+    ) -> None: ...
+    def forward(
+        self,
+        input: torch.Tensor,
+        splits_cpu: torch.Tensor,
+        routing_idx: torch.Tensor,
+        row_scale: torch.Tensor,
+    ) -> torch.Tensor: ...
 
 def test_nccl_signal_reduce_scatter(
     process_group: dist.ProcessGroup,

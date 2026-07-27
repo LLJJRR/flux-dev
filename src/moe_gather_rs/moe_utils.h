@@ -54,7 +54,8 @@ void topk_reduce_scatter_impl(
     int32_t topk,
     void *output_ptr,
     int M,
-    int N);
+    int N,
+    cudaStream_t stream);
 
 void sort_impl(
     int64_t num_elems,

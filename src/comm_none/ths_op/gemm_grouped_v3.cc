@@ -117,19 +117,22 @@ class GemmGroupedV3::GemmGroupedV3Impl {
     {
       // initialize args vectors
       uint8_t const *ptr_A_cur = reinterpret_cast<uint8_t *>(input.data_ptr());
-      uint8_t const *ptr_B_cur = reinterpret_cast<uint8_t *>(weight.data_ptr());
+      uint8_t const *ptr_B_base = reinterpret_cast<uint8_t *>(weight.data_ptr());
       uint8_t *ptr_D_cur = reinterpret_cast<uint8_t *>(output.data_ptr());
 
       for (int i = 0; i < this->num_experts; ++i) {
         int Mi = splits_cpu[i].item().toInt();
+        CHECK(Mi >= 0) << "expert split must be non-negative, got " << Mi
+                       << " for expert " << i;
         if (Mi == 0) {
           continue;
         }
         problem_sizes.emplace_back(N, Mi, K);
         ptr_A.emplace_back(ptr_A_cur);
         ptr_A_cur += Mi * K * c10::elementSize(input.scalar_type());
-        ptr_B.emplace_back(ptr_B_cur);
-        ptr_B_cur += N * K * c10::elementSize(weight.scalar_type());
+        ptr_B.emplace_back(
+            ptr_B_base + static_cast<int64_t>(i) * N * K *
+                             c10::elementSize(weight.scalar_type()));
         ptr_C.emplace_back(nullptr);
         ptr_D.emplace_back(ptr_D_cur);
         ptr_D_cur += Mi * N * c10::elementSize(output.scalar_type());

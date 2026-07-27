@@ -12,6 +12,7 @@ file(GLOB OP_REGS ${CMAKE_CURRENT_BINARY_DIR}/registers/*.cu)
 file(GLOB TUNING_CONFIGS tuning_config/*.cu)
 set(CU_FILES
   bsr_reduce.cu
+  moe_topk_reduce.cu
   padding_util.cu
   ring_reduce.cu
   ${OP_REGS}

@@ -50,7 +50,8 @@ topk_scatter_reduce(std::vector<torch::Tensor> inputs, torch::Tensor scatter_idx
       topk,
       output.data_ptr(),
       new_M,
-      N);
+      N,
+      c10::cuda::getCurrentCUDAStream());
   return output;
 }
 

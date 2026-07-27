@@ -68,7 +68,7 @@ def NNODES() -> int:
     return WORLD_SIZE // LOCAL_WORLD_SIZE
 
 
-def initialize_distributed():
+def initialize_distributed(init_flux_shm: bool = True):
     global _TP_GROUP
     assert _TP_GROUP is None, "TP_GROUP has already been initialized"
 
@@ -84,7 +84,8 @@ def initialize_distributed():
     _TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
 
     init_seed(seed=RANK)
-    flux.init_flux_shm(_TP_GROUP)
+    if init_flux_shm:
+        flux.init_flux_shm(_TP_GROUP)
     torch.cuda.synchronize()
     return _TP_GROUP
 

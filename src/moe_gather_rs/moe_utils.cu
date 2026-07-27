@@ -347,7 +347,8 @@ topk_reduce_scatter_impl(
     int32_t topk,
     void *output_ptr,
     int M,
-    int N) {
+    int N,
+    cudaStream_t stream) {
   constexpr int NTHREADS = 768;
   dim3 block_dim(NTHREADS);
   dim3 grid_dim(264);
@@ -386,7 +387,7 @@ topk_reduce_scatter_impl(
         args.M = M;
         args.N = N;
         topk_reduce_scatter_kernel<Element, NDIM, TOPK, NTHREADS, INPUTGROUPS>
-            <<<grid_dim, block_dim>>>(args);
+            <<<grid_dim, block_dim, 0, stream>>>(args);
       },
       [&]() {
         FLUX_CHECK(false) << "unsupported for topk=" << topk << " dtype:" << dtype << " Ndim:" << N

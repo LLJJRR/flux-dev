@@ -50,7 +50,7 @@ class PerfResult:
         self.total_ms = self.gemm_time_ms
 
     def __repr__(self) -> str:
-        return f"{self.name}: gemm {self.gemm_time_ms:.3f} ms"
+        return f"{self.name}: total {self.total_ms:.3f} ms"
 
 
 def perf_gemm(iters: int, warmup_iters: int, name: str, fn: callable):
@@ -207,6 +207,21 @@ def perf_triton(
     return perf_gemm(iters, warmup_iters, f"triton #{TP_GROUP.rank()}", fn)
 
 
+def create_flux_gather_rs_op(max_m: int, topk: int):
+    return flux.GemmGroupedV3GatherRS(
+        args.G,
+        max_m,
+        args.N,
+        topk,
+        RANK,
+        WORLD_SIZE,
+        args.T,
+        args.E,
+        args.input_groups,
+        args.ep_in_dp,
+    )
+
+
 def perf_flux(
     input: Union[torch.Tensor, List[torch.Tensor]],
     weight: Union[torch.Tensor, List[torch.Tensor]],
@@ -222,6 +237,7 @@ def perf_flux(
     output_vec_scale: Union[torch.Tensor, List[torch.Tensor], None],
     do_all_reduce: bool = False,
     use_read_mode: bool = False,
+    op=None,
 ):
     n_dim = args.N
     if isinstance(weight, torch.Tensor):
@@ -234,18 +250,8 @@ def perf_flux(
     is_s8 = input_dtype == torch.int8
     output_dtype = torch.bfloat16 if is_fp8 or is_s8 else input_dtype
     if flux.util.get_arch() >= 90:
-        op = flux.GemmGroupedV3GatherRS(
-            args.G,
-            max_m,
-            n_dim,
-            topk,
-            RANK,
-            WORLD_SIZE,
-            args.T,
-            args.E,
-            args.input_groups,
-            args.ep_in_dp,
-        )
+        if op is None:
+            op = create_flux_gather_rs_op(max_m, topk)
     else:
         op = flux.GemmGroupedV2GatherRSOp(
             TP_GROUP,
@@ -296,6 +302,23 @@ def perf_flux(
             )
 
     return perf_gemm(iters, warmup_iters, f"flux #{TP_GROUP.rank()}", fn)
+
+
+def perf_flux_nccl_rs(
+    input: torch.Tensor,
+    split_cpu: torch.Tensor,
+    routing_idx: torch.Tensor,
+    row_scale: torch.Tensor,
+    iters: int,
+    warmup_iters: int,
+    moe_nccl_op,
+):
+    def fn():
+        return moe_nccl_op.forward(input, split_cpu, routing_idx, row_scale)
+
+    return perf_gemm(
+        iters, warmup_iters, f"flux_nccl_rs #{TP_GROUP.rank()}", fn
+    )
 
 
 def tune_flux(
@@ -352,6 +375,13 @@ def tune_flux(
     return prof_ctx
 
 
+def tune_flux_nccl_gemm(input: torch.Tensor, split_cpu: torch.Tensor, grouped_gemm_op):
+    prof_ctx = flux.ProfilingContext(f"config_moe_nccl_gemm_sm{flux.get_arch()}")
+    grouped_gemm_op.profiling(input, split_cpu, prof_ctx)
+    torch.cuda.synchronize()
+    return prof_ctx
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-M", type=int, default=163840)
@@ -383,6 +413,24 @@ def parse_args():
     parser.add_argument("--triton-only", default=False, action="store_true", help="use triton")
     parser.add_argument("--profile", action="store_true", default=False)
     parser.add_argument("--tune", action="store_true", default=False)
+    parser.add_argument(
+        "--compare-nccl-rs",
+        action="store_true",
+        default=False,
+        help="compare native GatherRS with GroupedGEMM + top-k pack + NCCL ReduceScatter",
+    )
+    parser.add_argument(
+        "--nccl-rs-only",
+        action="store_true",
+        default=os.getenv("FLUX_MOE_GATHER_RS_NCCL_ONLY", "0") == "1",
+        help="run the opt-in NCCL Signal RS path without constructing the NVSHMEM GatherRS op",
+    )
+    parser.add_argument(
+        "--nccl-rs-n-split",
+        type=int,
+        default=int(os.getenv("FLUX_MOE_GATHER_RS_N_SPLIT", "2")),
+        help="number of N splits in the NCCL Signal RS producer pipeline",
+    )
     parser.add_argument("--input_groups", type=int, default=1, help="The number of input groups")
     parser.add_argument(
         "--all_reduce", default=False, action="store_true", help="whether to use all_reduce"
@@ -421,11 +469,36 @@ def _print_tensor_desc(name, tensor: Tuple[torch.Tensor, List[torch.Tensor]]):
 
 
 if __name__ == "__main__":
-    TP_GROUP = initialize_distributed()
+    args = parse_args()
+    assert not (args.compare_nccl_rs and args.nccl_rs_only), (
+        "--compare-nccl-rs and --nccl-rs-only are mutually exclusive"
+    )
+    use_nccl_rs = args.compare_nccl_rs or args.nccl_rs_only
+    if use_nccl_rs:
+        # The producer-ready protocol currently patches only Ring + Simple RS.
+        os.environ["NCCL_ALGO"] = "Ring"
+        os.environ["NCCL_PROTO"] = "Simple"
+    TP_GROUP = initialize_distributed(init_flux_shm=not args.nccl_rs_only)
     torch.use_deterministic_algorithms(False)
     RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
 
-    args = parse_args()
+    if RANK == 0:
+        mode = "nccl-only" if args.nccl_rs_only else "compare" if args.compare_nccl_rs else "nvshmem"
+        print(f"MoE GatherRS transport mode: {mode}, NCCL N split: {args.nccl_rs_n_split}")
+    if use_nccl_rs:
+        assert flux.util.get_arch() >= 90, "NCCL Signal RS currently requires SM90"
+        assert WORLD_SIZE == 2 and args.T == 2, "NCCL Signal RS currently requires TP2"
+        assert args.E == 1, "NCCL Signal RS currently requires EP1"
+        assert args.dtype in ("float16", "bfloat16"), (
+            "NCCL Signal RS currently requires FP16 or BF16"
+        )
+        assert args.input_groups == 1, "NCCL Signal RS currently supports one input group"
+        assert args.topk in (4, 5), "--compare-nccl-rs requires topk=4 or topk=5"
+        assert args.nccl_rs_n_split > 0 and args.N % args.nccl_rs_n_split == 0
+        assert (args.N // args.nccl_rs_n_split) % 256 == 0, "N/n_split must be 256-aligned"
+        assert not args.ep_in_dp, "--compare-nccl-rs does not support ep_in_dp"
+        assert not args.all_reduce, "--compare-nccl-rs requires ReduceScatter mode"
+        assert not args.triton_only, "--compare-nccl-rs is incompatible with --triton-only"
     if args.triton_only:
         if not args.triton:
             print("WARNING: force set --triton with --triton-only set.")
@@ -525,6 +598,26 @@ if __name__ == "__main__":
         output_vec_scales = output_vec_scales[0]
         _print_tensor_desc("input", inputs)
         _print_tensor_desc("weight", weights)
+
+    flux_gather_rs_op = None
+    nccl_grouped_gemm_op = None
+    moe_nccl_op = None
+    if flux.util.get_arch() >= 90 and not args.triton_only and not args.nccl_rs_only:
+        flux_gather_rs_op = create_flux_gather_rs_op(args.M, args.topk)
+    if use_nccl_rs:
+        split_gpu = split_cpu.to(device=inputs.device)
+        row_scale = (
+            torch.repeat_interleave(weight_scales, split_gpu)
+            * input_scales[0]
+            * output_vec_scales
+        )
+        if args.tune:
+            split_n = args.N // args.nccl_rs_n_split
+            tune_weight = weights.narrow(1, 0, split_n).contiguous()
+            nccl_grouped_gemm_op = flux.GemmGroupedV3(tune_weight, args.G)
+        moe_nccl_op = flux.MoeGatherRSNccl(
+            TP_GROUP, weights, args.G, args.topk, args.nccl_rs_n_split
+        )
     print("split_cpu:", random_seq_len)
     print("ag_input_len", ag_input_len)
     _print_tensor_desc("token_index", token_index)
@@ -535,27 +628,37 @@ if __name__ == "__main__":
     torch.distributed.barrier()
 
     if args.tune:
-        prof_ctx = tune_flux(
-            inputs,
-            weights,
-            split_cpu,
-            ag_input_len_cpu,
-            args.iters,
-            args.M,
-            args.topk,
-            routing_idx,
-            input_scales,
-            weight_scales,
-            output_vec_scales,
-        )
+        if not args.nccl_rs_only:
+            prof_ctx = tune_flux(
+                inputs,
+                weights,
+                split_cpu,
+                ag_input_len_cpu,
+                args.iters,
+                args.M,
+                args.topk,
+                routing_idx,
+                input_scales,
+                weight_scales,
+                output_vec_scales,
+            )
 
-        if RANK == 0:
-            print("====== Profiling Results =======")
-            print("\n".join(prof_ctx.get_all_prof_results()))
-            print("====== Generated Config Code =======")
-            print(prof_ctx.get_code())
+            if RANK == 0:
+                print("====== Profiling Results =======")
+                print("\n".join(prof_ctx.get_all_prof_results()))
+                print("====== Generated Config Code =======")
+                print(prof_ctx.get_code())
 
-        flux.load_tuning_record(prof_ctx.get_latest_record())
+            flux.load_tuning_record(prof_ctx.get_latest_record())
+
+        if use_nccl_rs:
+            nccl_prof_ctx = tune_flux_nccl_gemm(inputs, split_cpu, nccl_grouped_gemm_op)
+            if RANK == 0:
+                print("====== NCCL Baseline GEMM Profiling Results =======")
+                print("\n".join(nccl_prof_ctx.get_all_prof_results()))
+                print("====== NCCL Baseline GEMM Config Code =======")
+                print(nccl_prof_ctx.get_code())
+            flux.load_tuning_record(nccl_prof_ctx.get_latest_record())
 
     with flux.group_profile(
         name="moe_gather_rs_" + os.environ["TORCHELASTIC_RUN_ID"],
@@ -563,22 +666,64 @@ if __name__ == "__main__":
         group=TP_GROUP,
     ):
         if not args.triton_only:
-            perf_result_flux = perf_flux(
-                inputs,
-                weights,
-                split_cpu,
-                ag_input_len_cpu,
-                args.iters,
-                args.warmup_iters,
-                args.M,
-                args.topk,
-                routing_idx,
-                input_scales,
-                weight_scales,
-                output_vec_scales,
-                args.all_reduce,
-                args.use_read_mode,
-            )
+            def run_native(iters: int, warmup_iters: int):
+                return perf_flux(
+                    inputs,
+                    weights,
+                    split_cpu,
+                    ag_input_len_cpu,
+                    iters,
+                    warmup_iters,
+                    args.M,
+                    args.topk,
+                    routing_idx,
+                    input_scales,
+                    weight_scales,
+                    output_vec_scales,
+                    args.all_reduce,
+                    args.use_read_mode,
+                    op=flux_gather_rs_op,
+                )
+
+            if use_nccl_rs:
+                def run_nccl(iters: int, warmup_iters: int):
+                    return perf_flux_nccl_rs(
+                        inputs,
+                        split_cpu,
+                        routing_idx,
+                        row_scale,
+                        iters,
+                        warmup_iters,
+                        moe_nccl_op,
+                    )
+
+                if args.nccl_rs_only:
+                    perf_result_flux_nccl = run_nccl(args.iters, args.warmup_iters)
+                    perf_result_flux = perf_result_flux_nccl
+                else:
+                    mode_times = {"flux": [], "nccl": []}
+                    for mode in ("flux", "nccl", "nccl", "flux"):
+                        result = (
+                            run_native(args.iters, args.warmup_iters)
+                            if mode == "flux"
+                            else run_nccl(args.iters, args.warmup_iters)
+                        )
+                        mode_times[mode].append(result.total_ms)
+
+                    captured_flux = run_native(1, 0)
+                    captured_nccl = run_nccl(1, 0)
+                    perf_result_flux = PerfResult(
+                        captured_flux.name,
+                        captured_flux.output,
+                        sum(mode_times["flux"]) / len(mode_times["flux"]),
+                    )
+                    perf_result_flux_nccl = PerfResult(
+                        captured_nccl.name,
+                        captured_nccl.output,
+                        sum(mode_times["nccl"]) / len(mode_times["nccl"]),
+                    )
+            else:
+                perf_result_flux = run_native(args.iters, args.warmup_iters)
         if args.triton:
             perf_result_flux_triton = perf_triton(
                 inputs,
@@ -612,6 +757,29 @@ if __name__ == "__main__":
             args.all_reduce,
         )
 
+    if args.compare_nccl_rs:
+        compare_totals = torch.tensor(
+            [
+                perf_result_flux.total_ms,
+                perf_result_flux_nccl.total_ms,
+                perf_result_torch.total_ms,
+            ],
+            dtype=torch.float64,
+            device=inputs.device,
+        )
+        torch.distributed.all_reduce(
+            compare_totals, op=torch.distributed.ReduceOp.MAX, group=TP_GROUP
+        )
+        if RANK == 0:
+            flux_ms, nccl_ms, torch_ms = compare_totals.cpu().tolist()
+            nccl_vs_flux = (flux_ms - nccl_ms) / flux_ms * 100.0
+            nccl_vs_torch = (torch_ms - nccl_ms) / torch_ms * 100.0
+            print(
+                f"[MOE-GATHER-RS-NCCL] flux={flux_ms:.3f} ms, nccl={nccl_ms:.3f} ms, "
+                f"torch={torch_ms:.3f} ms, nccl_vs_flux={nccl_vs_flux:.2f}%, "
+                f"nccl_vs_torch={nccl_vs_torch:.2f}%"
+            )
+
     if TP_GROUP.rank() == 0:
         flux.testing.print_grouped_gemm_sol_time_ms(
             args.M // args.E,
@@ -627,6 +795,8 @@ if __name__ == "__main__":
     flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_torch))
     if not args.triton_only:
         flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux))
+        if args.compare_nccl_rs:
+            flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux_nccl))
     if args.triton:
         flux.exec_in_rank_order(TP_GROUP, lambda: log_perf(perf_result_flux_triton))
     atol, rtol = ABSOLUTE_THRESHOLD_MAP[input_dtype], RELATIVE_THRESHOLD_MAP[input_dtype]
@@ -647,6 +817,21 @@ if __name__ == "__main__":
         else:
             print("✅ flux and torch matches")
 
+    def check_nccl_result():
+        print(f"#{TP_GROUP.rank()} Threshold = Atol:{atol}  Rtol:{rtol}")
+        print(f"flux_nccl_rs output shape: {flux_nccl_output.size()}")
+        print(f"torch output shape: {torch_output.size()}")
+
+        try:
+            flux.torch_allclose(flux_nccl_output, torch_output, atol=atol, rtol=rtol)
+        except Exception as e:
+            torch.save(flux_nccl_output, f"flux_nccl_output_{TP_GROUP.rank()}.pt")
+            torch.save(torch_output, f"torch_output_{TP_GROUP.rank()}.pt")
+            print("❌ flux_nccl_rs and torch not matches")
+            raise e
+        else:
+            print("✅ flux_nccl_rs and torch matches")
+
     def check_triton_result():
         print(f"#{TP_GROUP.rank()} Threshold = Atol:{atol}  Rtol:{rtol}")
         print(f"triton output shape: {triton_output.size()}")
@@ -666,6 +851,9 @@ if __name__ == "__main__":
     if not args.triton_only:
         flux_output = perf_result_flux.output
         flux.exec_in_rank_order(TP_GROUP, check_result)
+        if args.compare_nccl_rs:
+            flux_nccl_output = perf_result_flux_nccl.output
+            flux.exec_in_rank_order(TP_GROUP, check_nccl_result)
     if args.triton:
         triton_output = perf_result_flux_triton.output
         flux.exec_in_rank_order(TP_GROUP, check_triton_result)

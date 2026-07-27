@@ -52,8 +52,9 @@ class NcclSignalReduceScatter {
       void *output,
       size_t count_per_rank,
       ncclDataType_t datatype,
+      int split,
       cudaStream_t compute_stream);
-  void mark_ready(int rank_segment, cudaStream_t compute_stream);
+  void mark_ready(int rank_segment, int split_idx, cudaStream_t compute_stream);
   void finish_overlap(cudaStream_t compute_stream);
 
  private:
@@ -68,6 +69,7 @@ class NcclSignalReduceScatter {
   cudaEvent_t completion_event_ = nullptr;
   int producer_epoch_ = 0;
   bool overlap_active_ = false;
+  int active_split_ = 1;
 };
 
 }  // namespace bytedance::flux::ths_op
