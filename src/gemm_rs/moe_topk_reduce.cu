@@ -85,6 +85,32 @@ __global__ void moe_topk_reduce_kernel(MoeTopKReduceArgs<Element> args) {
 
 }  // namespace
 
+void moe_topk_reduce_prepare(DataTypeEnum dtype, int32_t topk, int input_groups) {
+  tuple_return_if(
+      tuple_cartesian_product(
+          cute::make_tuple(_FP16{}, _BF16{}),
+          cute::make_tuple(cute::_4{}, cute::_5{}),
+          cute::make_tuple(cute::_1{}, cute::_2{})),
+      [&](auto config) {
+        auto [config_dtype, config_topk, config_groups] = config;
+        return config_dtype == dtype && config_topk == topk && config_groups == input_groups;
+      },
+      [&](auto config) {
+        auto [config_dtype, config_topk, config_groups] = config;
+        constexpr int kTopK = decltype(config_topk){};
+        constexpr int kGroups = decltype(config_groups){};
+        constexpr int kThreads = 768;
+        using Element = decltype(to_cuda_dtype(config_dtype));
+        cudaFuncAttributes attributes{};
+        CUDA_CHECK(cudaFuncGetAttributes(
+            &attributes, moe_topk_reduce_kernel<Element, kTopK, kThreads, kGroups>));
+      },
+      [&]() {
+        FLUX_CHECK(false) << "unsupported MoE top-k reduce configuration: dtype=" << dtype
+                          << ", topk=" << topk << ", input_groups=" << input_groups;
+      });
+}
+
 void moe_topk_reduce_out(
     void **inputs,
     int input_groups,

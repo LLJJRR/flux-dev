@@ -7,6 +7,8 @@
 
 namespace bytedance::flux {
 
+void moe_topk_reduce_prepare(DataTypeEnum dtype, int32_t topk, int input_groups);
+
 void moe_topk_reduce_out(
     void **inputs,
     int input_groups,

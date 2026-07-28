@@ -103,6 +103,13 @@ class MoeGatherRSNccl::Impl {
           << "MoeGatherRSNccl reuses internal buffers and must stay on one CUDA stream";
     }
 
+    if (!producer_kernel_prepared_) {
+      // Loading a producer module after a waiting NCCL grid is resident can
+      // make CUDA wait for the consumer that is itself waiting for producerReady.
+      moe_topk_reduce_prepare(from_torch_dtype(input.scalar_type()), topk_, 1);
+      producer_kernel_prepared_ = true;
+    }
+
     // Resolve the shared split shape before starting a consumer that can wait
     // indefinitely. Unsupported GEMM configurations then cannot strand NCCL.
     torch::Tensor grouped_output = grouped_gemms_[0]->forward(input, splits_cpu);
@@ -132,45 +139,6 @@ class MoeGatherRSNccl::Impl {
           row_scale.data_ptr<float>(),
           stream);
     };
-
-    if (!producer_kernels_warmed_) {
-      // CUDA may lazily load the first TopK/GEMM kernel. Doing that after a
-      // waiting NCCL grid is resident can make the runtime wait for NCCL while
-      // NCCL waits for producerReady. Initialize and complete every producer
-      // variant once before launching the first overlapped collective.
-      for (int split = 0; split < n_split_; ++split) {
-        if (split != 0) {
-          grouped_output = grouped_gemms_[split]->forward(input, splits_cpu);
-        }
-        for (int segment : segment_order) {
-          produce_segment(grouped_output, split, segment);
-        }
-      }
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      signal_rs_.start_overlap(
-          packed_output_.data_ptr(),
-          split_output_.data_ptr(),
-          output_.numel(),
-          to_nccl_dtype(output_.scalar_type()),
-          n_split_,
-          stream);
-      for (int split = 0; split < n_split_; ++split) {
-        for (int segment : segment_order) {
-          signal_rs_.mark_ready(segment, split, stream);
-        }
-      }
-      signal_rs_.finish_overlap(stream);
-      producer_kernels_warmed_ = true;
-      moe_unpack_split_major_out(
-          split_output_.data_ptr(),
-          output_.data_ptr(),
-          from_torch_dtype(output_.scalar_type()),
-          tokens_per_rank,
-          n_dim_,
-          n_split_,
-          stream);
-      return output_;
-    }
 
     signal_rs_.start_overlap(
         packed_output_.data_ptr(),
@@ -242,7 +210,7 @@ class MoeGatherRSNccl::Impl {
   torch::Tensor output_;
   cudaStream_t compute_stream_ = nullptr;
   bool compute_stream_bound_ = false;
-  bool producer_kernels_warmed_ = false;
+  bool producer_kernel_prepared_ = false;
 };
 
 MoeGatherRSNccl::MoeGatherRSNccl(
