@@ -106,6 +106,72 @@ class MoeGatherRSNccl::Impl {
     // Resolve the shared split shape before starting a consumer that can wait
     // indefinitely. Unsupported GEMM configurations then cannot strand NCCL.
     torch::Tensor grouped_output = grouped_gemms_[0]->forward(input, splits_cpu);
+    int peer = (group_->get_rank() + 1) % group_->get_size();
+    int segment_order[] = {peer, group_->get_rank()};
+    int64_t chunk_n = n_dim_ / n_split_;
+    auto produce_segment = [&](torch::Tensor const &split_output, int split, int segment) {
+      FLUX_CHECK(
+          split_output.scalar_type() == torch::kFloat16 ||
+          split_output.scalar_type() == torch::kBFloat16)
+          << "NCCL MoE GatherRS currently supports FP16/BF16 output";
+      void *inputs[] = {split_output.data_ptr()};
+      int64_t output_offset =
+          (segment * n_split_ + split) * tokens_per_rank * chunk_n;
+      moe_topk_reduce_out(
+          inputs,
+          1,
+          from_torch_dtype(split_output.scalar_type()),
+          routing_idx.data_ptr<int32_t>(),
+          topk_,
+          static_cast<char *>(packed_output_.data_ptr()) +
+              output_offset * split_output.element_size(),
+          token_count,
+          chunk_n,
+          segment * tokens_per_rank,
+          tokens_per_rank,
+          row_scale.data_ptr<float>(),
+          stream);
+    };
+
+    if (!producer_kernels_warmed_) {
+      // CUDA may lazily load the first TopK/GEMM kernel. Doing that after a
+      // waiting NCCL grid is resident can make the runtime wait for NCCL while
+      // NCCL waits for producerReady. Initialize and complete every producer
+      // variant once before launching the first overlapped collective.
+      for (int split = 0; split < n_split_; ++split) {
+        if (split != 0) {
+          grouped_output = grouped_gemms_[split]->forward(input, splits_cpu);
+        }
+        for (int segment : segment_order) {
+          produce_segment(grouped_output, split, segment);
+        }
+      }
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      signal_rs_.start_overlap(
+          packed_output_.data_ptr(),
+          split_output_.data_ptr(),
+          output_.numel(),
+          to_nccl_dtype(output_.scalar_type()),
+          n_split_,
+          stream);
+      for (int split = 0; split < n_split_; ++split) {
+        for (int segment : segment_order) {
+          signal_rs_.mark_ready(segment, split, stream);
+        }
+      }
+      signal_rs_.finish_overlap(stream);
+      producer_kernels_warmed_ = true;
+      moe_unpack_split_major_out(
+          split_output_.data_ptr(),
+          output_.data_ptr(),
+          from_torch_dtype(output_.scalar_type()),
+          tokens_per_rank,
+          n_dim_,
+          n_split_,
+          stream);
+      return output_;
+    }
+
     signal_rs_.start_overlap(
         packed_output_.data_ptr(),
         split_output_.data_ptr(),
@@ -114,9 +180,6 @@ class MoeGatherRSNccl::Impl {
         n_split_,
         stream);
 
-    int peer = (group_->get_rank() + 1) % group_->get_size();
-    int segment_order[] = {peer, group_->get_rank()};
-    int64_t chunk_n = n_dim_ / n_split_;
     // NCCL sees contiguous [rank][N-split][token][N-chunk] blocks. Producing the
     // peer-owned block first follows the TP2 Ring ReduceScatter consumption order.
     try {
@@ -124,28 +187,8 @@ class MoeGatherRSNccl::Impl {
         if (split != 0) {
           grouped_output = grouped_gemms_[split]->forward(input, splits_cpu);
         }
-        FLUX_CHECK(
-            grouped_output.scalar_type() == torch::kFloat16 ||
-            grouped_output.scalar_type() == torch::kBFloat16)
-            << "NCCL MoE GatherRS currently supports FP16/BF16 output";
-        void *inputs[] = {grouped_output.data_ptr()};
         for (int segment : segment_order) {
-          int64_t output_offset =
-              (segment * n_split_ + split) * tokens_per_rank * chunk_n;
-          moe_topk_reduce_out(
-              inputs,
-              1,
-              from_torch_dtype(grouped_output.scalar_type()),
-              routing_idx.data_ptr<int32_t>(),
-              topk_,
-              static_cast<char *>(packed_output_.data_ptr()) +
-                  output_offset * grouped_output.element_size(),
-              token_count,
-              chunk_n,
-              segment * tokens_per_rank,
-              tokens_per_rank,
-              row_scale.data_ptr<float>(),
-              stream);
+          produce_segment(grouped_output, split, segment);
           signal_rs_.mark_ready(segment, split, stream);
         }
       }
@@ -199,6 +242,7 @@ class MoeGatherRSNccl::Impl {
   torch::Tensor output_;
   cudaStream_t compute_stream_ = nullptr;
   bool compute_stream_bound_ = false;
+  bool producer_kernels_warmed_ = false;
 };
 
 MoeGatherRSNccl::MoeGatherRSNccl(
