@@ -216,6 +216,7 @@ NcclSignalReduceScatter::start_overlap(
       << "experimental NCCL ReduceScatter overlap requires NCCL_PROTO=Simple";
   FLUX_CHECK_LT(producer_epoch_, std::numeric_limits<int>::max());
   ++producer_epoch_;
+  nccl_signal_debug(group_->get_rank(), "start_overlap enqueue begin");
   active_split_ = split;
   size_t ready_bytes = sizeof(int) * group_->get_size() * split;
   if (producer_ready_storage_.nbytes() < ready_bytes) {
@@ -262,6 +263,7 @@ NcclSignalReduceScatter::start_overlap(
       producer_epoch_,
       CU_STREAM_WAIT_VALUE_GEQ));
   overlap_active_ = true;
+  nccl_signal_debug(group_->get_rank(), "start_overlap enqueue end");
 }
 
 void
@@ -279,6 +281,16 @@ NcclSignalReduceScatter::mark_ready(
           rank_segment * active_split_ + split_idx),
       producer_epoch_,
       CU_STREAM_WRITE_VALUE_DEFAULT));
+  if (nccl_signal_debug_enabled()) {
+    std::fprintf(
+        stderr,
+        "[FLUX_RS_NCCL_DEBUG] rank=%d mark_ready segment=%d split=%d epoch=%d\n",
+        group_->get_rank(),
+        rank_segment,
+        split_idx,
+        producer_epoch_);
+    std::fflush(stderr);
+  }
 }
 
 void
@@ -286,6 +298,7 @@ NcclSignalReduceScatter::finish_overlap(cudaStream_t compute_stream) {
   FLUX_CHECK(overlap_active_) << "NCCL ReduceScatter overlap has not been started";
   CUDA_CHECK(cudaStreamWaitEvent(compute_stream, completion_event_, 0));
   overlap_active_ = false;
+  nccl_signal_debug(group_->get_rank(), "finish_overlap wait enqueued");
 }
 
 }  // namespace bytedance::flux::ths_op
