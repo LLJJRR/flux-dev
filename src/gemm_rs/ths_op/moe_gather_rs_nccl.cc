@@ -94,10 +94,18 @@ class MoeGatherRSNccl::Impl {
     int64_t tokens_per_rank = token_count / group_->get_size();
     ensure_buffers(input, token_count, tokens_per_rank, n_dim_);
 
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    if (!compute_stream_bound_) {
+      compute_stream_ = stream;
+      compute_stream_bound_ = true;
+    } else {
+      FLUX_CHECK_EQ(stream, compute_stream_)
+          << "MoeGatherRSNccl reuses internal buffers and must stay on one CUDA stream";
+    }
+
     // Resolve the shared split shape before starting a consumer that can wait
     // indefinitely. Unsupported GEMM configurations then cannot strand NCCL.
     torch::Tensor grouped_output = grouped_gemms_[0]->forward(input, splits_cpu);
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     signal_rs_.start_overlap(
         packed_output_.data_ptr(),
         split_output_.data_ptr(),
@@ -111,34 +119,45 @@ class MoeGatherRSNccl::Impl {
     int64_t chunk_n = n_dim_ / n_split_;
     // NCCL sees contiguous [rank][N-split][token][N-chunk] blocks. Producing the
     // peer-owned block first follows the TP2 Ring ReduceScatter consumption order.
-    for (int split = 0; split < n_split_; ++split) {
-      if (split != 0) {
-        grouped_output = grouped_gemms_[split]->forward(input, splits_cpu);
+    try {
+      for (int split = 0; split < n_split_; ++split) {
+        if (split != 0) {
+          grouped_output = grouped_gemms_[split]->forward(input, splits_cpu);
+        }
+        FLUX_CHECK(
+            grouped_output.scalar_type() == torch::kFloat16 ||
+            grouped_output.scalar_type() == torch::kBFloat16)
+            << "NCCL MoE GatherRS currently supports FP16/BF16 output";
+        void *inputs[] = {grouped_output.data_ptr()};
+        for (int segment : segment_order) {
+          int64_t output_offset =
+              (segment * n_split_ + split) * tokens_per_rank * chunk_n;
+          moe_topk_reduce_out(
+              inputs,
+              1,
+              from_torch_dtype(grouped_output.scalar_type()),
+              routing_idx.data_ptr<int32_t>(),
+              topk_,
+              static_cast<char *>(packed_output_.data_ptr()) +
+                  output_offset * grouped_output.element_size(),
+              token_count,
+              chunk_n,
+              segment * tokens_per_rank,
+              tokens_per_rank,
+              row_scale.data_ptr<float>(),
+              stream);
+          signal_rs_.mark_ready(segment, split, stream);
+        }
       }
-      FLUX_CHECK(
-          grouped_output.scalar_type() == torch::kFloat16 ||
-          grouped_output.scalar_type() == torch::kBFloat16)
-          << "NCCL MoE GatherRS currently supports FP16/BF16 output";
-      void *inputs[] = {grouped_output.data_ptr()};
-      for (int segment : segment_order) {
-        int64_t output_offset =
-            (segment * n_split_ + split) * tokens_per_rank * chunk_n;
-        moe_topk_reduce_out(
-            inputs,
-            1,
-            from_torch_dtype(grouped_output.scalar_type()),
-            routing_idx.data_ptr<int32_t>(),
-            topk_,
-            static_cast<char *>(packed_output_.data_ptr()) +
-                output_offset * grouped_output.element_size(),
-            token_count,
-            chunk_n,
-            segment * tokens_per_rank,
-            tokens_per_rank,
-            row_scale.data_ptr<float>(),
-            stream);
-        signal_rs_.mark_ready(segment, split, stream);
+    } catch (...) {
+      // Unblock every consumer wait before propagating a host dispatch error.
+      for (int split = 0; split < n_split_; ++split) {
+        for (int segment = 0; segment < group_->get_size(); ++segment) {
+          signal_rs_.mark_ready(segment, split, stream);
+        }
       }
+      signal_rs_.finish_overlap(stream);
+      throw;
     }
     signal_rs_.finish_overlap(stream);
     moe_unpack_split_major_out(
@@ -178,6 +197,8 @@ class MoeGatherRSNccl::Impl {
   torch::Tensor packed_output_;
   torch::Tensor split_output_;
   torch::Tensor output_;
+  cudaStream_t compute_stream_ = nullptr;
+  bool compute_stream_bound_ = false;
 };
 
 MoeGatherRSNccl::MoeGatherRSNccl(
