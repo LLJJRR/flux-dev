@@ -194,7 +194,9 @@ NcclSignalReduceScatter::start_overlap(
     void *output,
     size_t count_per_rank,
     ncclDataType_t datatype,
-    int split) {
+    int split,
+    cudaStream_t compute_stream) {
+  (void)compute_stream;
   FLUX_CHECK(input != nullptr);
   FLUX_CHECK(output != nullptr);
   FLUX_CHECK_GT(count_per_rank, 0);
