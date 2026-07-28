@@ -111,8 +111,7 @@ class MoeGatherRSNccl::Impl {
         split_output_.data_ptr(),
         output_.numel(),
         to_nccl_dtype(output_.scalar_type()),
-        n_split_,
-        stream);
+        n_split_);
 
     int peer = (group_->get_rank() + 1) % group_->get_size();
     int segment_order[] = {peer, group_->get_rank()};

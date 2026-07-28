@@ -52,8 +52,7 @@ class NcclSignalReduceScatter {
       void *output,
       size_t count_per_rank,
       ncclDataType_t datatype,
-      int split,
-      cudaStream_t compute_stream);
+      int split);
   void mark_ready(int rank_segment, int split_idx, cudaStream_t compute_stream);
   void finish_overlap(cudaStream_t compute_stream);
 
@@ -62,8 +61,6 @@ class NcclSignalReduceScatter {
   ncclComm_t nccl_comm_ = nullptr;
   torch::Tensor signal_storage_;
   torch::Tensor counter_storage_;
-  torch::Tensor launch_signal_storage_;
-  torch::Tensor launch_counter_storage_;
   torch::Tensor producer_ready_storage_;
   cudaStream_t comm_stream_ = nullptr;
   cudaEvent_t completion_event_ = nullptr;

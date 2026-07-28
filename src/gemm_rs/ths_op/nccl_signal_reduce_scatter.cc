@@ -86,13 +86,9 @@ NcclSignalReduceScatter::NcclSignalReduceScatter(std::shared_ptr<Group> group)
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
       signal_storage_(make_byte_storage(sizeof(FluxNcclSignalLayout))),
       counter_storage_(make_byte_storage(sizeof(int) * group_->get_size())),
-      launch_signal_storage_(make_byte_storage(sizeof(int))),
-      launch_counter_storage_(make_byte_storage(sizeof(int))),
       producer_ready_storage_(make_byte_storage(sizeof(int) * group_->get_size())) {
   CUDA_CHECK(cudaStreamCreateWithFlags(&comm_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaEventCreateWithFlags(&completion_event_, cudaEventDisableTiming));
-  CUDA_CHECK(cudaMemsetAsync(
-      launch_signal_storage_.data_ptr(), 0, launch_signal_storage_.nbytes(), comm_stream_));
   CUDA_CHECK(cudaMemsetAsync(
       producer_ready_storage_.data_ptr(), 0, producer_ready_storage_.nbytes(), comm_stream_));
   nccl_signal_debug(group_->get_rank(), "NcclSignalReduceScatter constructed");
@@ -198,8 +194,7 @@ NcclSignalReduceScatter::start_overlap(
     void *output,
     size_t count_per_rank,
     ncclDataType_t datatype,
-    int split,
-    cudaStream_t compute_stream) {
+    int split) {
   FLUX_CHECK(input != nullptr);
   FLUX_CHECK(output != nullptr);
   FLUX_CHECK_GT(count_per_rank, 0);
@@ -225,20 +220,17 @@ NcclSignalReduceScatter::start_overlap(
         producer_ready_storage_.data_ptr(), 0, producer_ready_storage_.nbytes(), comm_stream_));
   }
 
-  CUDA_CHECK(cudaMemsetAsync(
-      launch_counter_storage_.data_ptr(), 0, launch_counter_storage_.nbytes(), comm_stream_));
-
   FluxNcclSignalLayout signal = {
       .barrier = nullptr,
       .counters = nullptr,
-      .launchSignal = static_cast<int *>(launch_signal_storage_.data_ptr()),
+      .launchSignal = nullptr,
       .split = split,
       .preReadyRankToken = 0,
       .readyCycles = nullptr,
       .startCycles = nullptr,
       .endCycles = nullptr,
       .producerReady = static_cast<int *>(producer_ready_storage_.data_ptr()),
-      .launchCounter = static_cast<int *>(launch_counter_storage_.data_ptr()),
+      .launchCounter = nullptr,
       .producerEpoch = producer_epoch_,
   };
   CUDA_CHECK(cudaMemcpyAsync(
@@ -257,11 +249,6 @@ NcclSignalReduceScatter::start_overlap(
       nccl_comm_,
       comm_stream_));
   CUDA_CHECK(cudaEventRecord(completion_event_, comm_stream_));
-  CU_CHECK(CUStreamWaitValue(
-      compute_stream,
-      reinterpret_cast<CUdeviceptr>(launch_signal_storage_.data_ptr()),
-      producer_epoch_,
-      CU_STREAM_WAIT_VALUE_GEQ));
   overlap_active_ = true;
   nccl_signal_debug(group_->get_rank(), "start_overlap enqueue end");
 }
