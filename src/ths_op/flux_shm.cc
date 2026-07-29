@@ -139,7 +139,13 @@ nvshmem_create_tensor_list(
     } else {
       void *rptr = nvshmem_ptr(ptr, rank_global);
       FLUX_CHECK(rptr != nullptr) << "rank " << rank;
-      tensors.emplace_back(at::from_blob(rptr, shape, option_gpu));
+      cudaPointerAttributes attributes{};
+      CUDA_CHECK(cudaPointerGetAttributes(&attributes, rptr));
+      FLUX_CHECK_EQ(attributes.type, cudaMemoryTypeDevice)
+          << "NVSHMEM peer pointer must reference device memory";
+      auto peer_option_gpu =
+          at::TensorOptions(at::kCUDA).dtype(dtype).device_index(attributes.device);
+      tensors.emplace_back(at::from_blob(rptr, shape, peer_option_gpu));
     }
   }
 
