@@ -389,7 +389,10 @@ def parse_args():
     parser.add_argument("-K", type=int, default=5120)
     parser.add_argument("-G", type=int, default=32)
     parser.add_argument("-E", type=int, default=4, help="Expert parallel world size")
-    parser.add_argument("-T", type=int, default=2, help="Tensor parallel world size")
+    parser.add_argument(
+        "-T", type=int, default=None,
+        help="Tensor parallel world size (defaults to WORLD_SIZE / E for NCCL mode)",
+    )
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--iters", default=10, type=int, help="perf iterations")
     parser.add_argument("--warmup_iters", default=5, type=int, help="warmup iterations")
@@ -482,12 +485,17 @@ if __name__ == "__main__":
     torch.use_deterministic_algorithms(False)
     RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
 
+    if args.T is None:
+        # NCCL paths run one TP group over the launched ranks by default.
+        # Preserve the historical TP2 default for the NVSHMEM-only path.
+        args.T = WORLD_SIZE // args.E if use_nccl_rs else 2
+    assert args.T * args.E == WORLD_SIZE, "world size must equal TP x EP"
+
     if RANK == 0:
         mode = "nccl-only" if args.nccl_rs_only else "compare" if args.compare_nccl_rs else "nvshmem"
         print(f"MoE GatherRS transport mode: {mode}, NCCL N split: {args.nccl_rs_n_split}")
     if use_nccl_rs:
         assert flux.util.get_arch() >= 90, "NCCL Signal RS currently requires SM90"
-        assert WORLD_SIZE == args.T * args.E, "world size must equal TP x EP"
         assert args.E == 1, "NCCL Signal RS currently requires EP1"
         assert args.dtype in ("float16", "bfloat16"), (
             "NCCL Signal RS currently requires FP16 or BF16"

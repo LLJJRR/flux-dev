@@ -309,15 +309,14 @@ def perf_flux_nccl_overlap_rs(
 ) -> OverlapPerfResult:
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
-    if world_size != 2:
-        raise ValueError("--overlap-rank-split currently requires TP2")
-
     m_per_rank = input.size(0) // world_size
     full_output = torch.empty((input.size(0), weight.size(0)), dtype=input.dtype, device=input.device)
     output = torch.empty((m_per_rank, weight.size(0)), dtype=input.dtype, device=input.device)
     gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
     nccl_rs = flux_mod.NcclSignalReduceScatter(group)
-    segment_order = (1 - rank, rank)
+    # Match NCCL Ring+Simple ReduceScatter's receive order: the local rank's
+    # predecessor first, then walk backwards around the ring.
+    segment_order = tuple((rank - 1 - i) % world_size for i in range(world_size))
 
     def run_split_gemm() -> None:
         for segment in segment_order:

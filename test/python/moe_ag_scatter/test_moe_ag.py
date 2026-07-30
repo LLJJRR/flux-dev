@@ -460,7 +460,6 @@ if __name__ == "__main__":
     args = parse_args()
     if args.compare_nccl_wait:
         assert not args.triton_only, "--compare-nccl-wait is incompatible with --triton-only"
-        assert DIST_ENV.WORLD_SIZE == 2, "--compare-nccl-wait currently requires TP2"
         assert args.E == 1, "--compare-nccl-wait currently requires EP1"
         assert flux.util.get_arch() >= 90, "--compare-nccl-wait requires the SM90 MoE path"
         os.environ["FLUX_MOE_AG_NCCL_SIGNAL"] = "1"

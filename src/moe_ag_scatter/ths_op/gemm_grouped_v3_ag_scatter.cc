@@ -101,8 +101,6 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
 
   void
   check_nccl_signal_ag_support() const {
-    FLUX_CHECK_EQ(tp_env.world_size, 2)
-        << "FLUX_MOE_AG_NCCL_SIGNAL currently supports TP2 only";
     FLUX_CHECK_EQ(tp_env.ep_size, 1)
         << "FLUX_MOE_AG_NCCL_SIGNAL currently supports EP1 only";
     FLUX_CHECK_EQ(tp_env.nnodes, 1)
