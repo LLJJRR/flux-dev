@@ -14,7 +14,15 @@ export CUDA_MODULE_LOADING=LAZY # EAGER if launch the consumer kernel before the
 export BYTED_TORCH_BYTECCL=O0
 export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:=23}
 
-nproc_per_node=$(nvidia-smi --list-gpus | wc -l)
+# Match torchrun's local rank space to CUDA's visible-device space.  Counting
+# the physical GPUs from nvidia-smi is wrong when CUDA_VISIBLE_DEVICES masks
+# devices (and also breaks UUID-based visibility lists).
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a visible_devices <<< "${CUDA_VISIBLE_DEVICES}"
+  nproc_per_node=${#visible_devices[@]}
+else
+  nproc_per_node=$(nvidia-smi --list-gpus | wc -l)
+fi
 nnodes=1
 node_rank=0
 master_addr="127.0.0.1"
