@@ -203,8 +203,6 @@ NcclSignalReduceScatter::start_overlap(
   FLUX_CHECK_GT(split, 0);
   FLUX_CHECK_EQ(count_per_rank % split, 0);
   FLUX_CHECK(!overlap_active_) << "previous NCCL ReduceScatter overlap is still active";
-  FLUX_CHECK_EQ(group_->get_size(), 2)
-      << "experimental rank-split NCCL ReduceScatter overlap currently requires TP2";
   const char *algo = std::getenv("NCCL_ALGO");
   FLUX_CHECK(algo != nullptr && std::strcmp(algo, "Ring") == 0)
       << "experimental NCCL ReduceScatter overlap requires NCCL_ALGO=Ring";

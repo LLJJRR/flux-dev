@@ -45,8 +45,6 @@ class MoeGatherRSNccl::Impl {
         topk_(topk),
         n_split_(n_split),
         n_dim_(0) {
-    FLUX_CHECK_EQ(group_->get_size(), 2)
-        << "NCCL MoE GatherRS currently supports TP2 only";
     FLUX_CHECK(get_arch() == ArchEnum::Sm90)
         << "NCCL MoE GatherRS currently supports SM90 only";
     FLUX_CHECK(topk_ == 4 || topk_ == 5)
@@ -113,8 +111,15 @@ class MoeGatherRSNccl::Impl {
     // Resolve the shared split shape before starting a consumer that can wait
     // indefinitely. Unsupported GEMM configurations then cannot strand NCCL.
     torch::Tensor grouped_output = grouped_gemms_[0]->forward(input, splits_cpu);
-    int peer = (group_->get_rank() + 1) % group_->get_size();
-    int segment_order[] = {peer, group_->get_rank()};
+    // Ring ReduceScatter consumes rank blocks in reverse ring order: the
+    // predecessor block first, then the remaining predecessors, and finally
+    // the local block. This is the TP2 order [peer, self] generalized to any
+    // ring size.
+    std::vector<int> segment_order(group_->get_size());
+    for (int i = 0; i < group_->get_size(); ++i) {
+      segment_order[i] =
+          (group_->get_rank() - 1 - i + group_->get_size()) % group_->get_size();
+    }
     int64_t chunk_n = n_dim_ / n_split_;
     auto produce_segment = [&](torch::Tensor const &split_output, int split, int segment) {
       FLUX_CHECK(
@@ -148,8 +153,8 @@ class MoeGatherRSNccl::Impl {
         n_split_,
         stream);
 
-    // NCCL sees contiguous [rank][N-split][token][N-chunk] blocks. Producing the
-    // peer-owned block first follows the TP2 Ring ReduceScatter consumption order.
+    // NCCL sees contiguous [rank][N-split][token][N-chunk] blocks. Producing
+    // blocks in segment_order follows the Ring ReduceScatter consumption order.
     try {
       for (int split = 0; split < n_split_; ++split) {
         if (split != 0) {

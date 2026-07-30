@@ -487,7 +487,7 @@ if __name__ == "__main__":
         print(f"MoE GatherRS transport mode: {mode}, NCCL N split: {args.nccl_rs_n_split}")
     if use_nccl_rs:
         assert flux.util.get_arch() >= 90, "NCCL Signal RS currently requires SM90"
-        assert WORLD_SIZE == 2 and args.T == 2, "NCCL Signal RS currently requires TP2"
+        assert WORLD_SIZE == args.T * args.E, "world size must equal TP x EP"
         assert args.E == 1, "NCCL Signal RS currently requires EP1"
         assert args.dtype in ("float16", "bfloat16"), (
             "NCCL Signal RS currently requires FP16 or BF16"
