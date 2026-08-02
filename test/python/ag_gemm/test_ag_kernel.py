@@ -757,6 +757,10 @@ def parse_args():
         help="run native flux and NCCL fused signal flux in the same test process",
     )
     parser.add_argument(
+        "--nccl_signal_only", action="store_true",
+        help="skip native Flux and test only PyTorch vs NCCL Signal",
+    )
+    parser.add_argument(
         "--gather_input",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -779,6 +783,8 @@ if __name__ == "__main__":
     RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
 
     args = parse_args()
+    if args.nccl_signal_only:
+        args.compare_nccl_signal = True
 
     input_dtype = DTYPE_MAP[args.dtype]
     is_fp8 = is_fp8_dtype(input_dtype)
@@ -851,8 +857,10 @@ if __name__ == "__main__":
             args.warmup,
             args.iters,
         )
+        perf_res_flux = None
         if args.compare_nccl_signal:
-            with ag_nccl_signal_env(enabled=False):
+            if not args.nccl_signal_only:
+              with ag_nccl_signal_env(enabled=False):
                 perf_res_flux = perf_flux(
                     input,
                     weight,
@@ -912,7 +920,7 @@ if __name__ == "__main__":
             )
             perf_res_flux_nccl_fused = None
 
-        perf_res_flux_no_overlap = perf_flux_no_overlap(
+        perf_res_flux_no_overlap = None if args.nccl_signal_only else perf_flux_no_overlap(
             input,
             weight,
             bias,
@@ -948,10 +956,12 @@ if __name__ == "__main__":
     for i in range(TP_GROUP.size()):
         if i == TP_GROUP.rank():
             log_perf(perf_res_torch)
-            log_perf(perf_res_flux)
+            if perf_res_flux is not None:
+                log_perf(perf_res_flux)
             if perf_res_flux_nccl_fused is not None:
                 log_perf(perf_res_flux_nccl_fused)
-            log_perf(perf_res_flux_no_overlap)
+            if perf_res_flux_no_overlap is not None:
+                log_perf(perf_res_flux_no_overlap)
             if args.triton:
                 log_perf(perf_res_triton)
         torch.distributed.barrier()
@@ -961,7 +971,7 @@ if __name__ == "__main__":
     atol = THRESHOLD_MAP[input_dtype]
     rtol = THRESHOLD_MAP[input_dtype]
 
-    flux_results = [perf_res_flux]
+    flux_results = [] if perf_res_flux is None else [perf_res_flux]
     if perf_res_flux_nccl_fused is not None:
         flux_results.append(perf_res_flux_nccl_fused)
 
@@ -997,8 +1007,8 @@ if __name__ == "__main__":
         else:
             print(f"✅ {perf_res.name.split()[0]} check passed")
 
-    flux_output = perf_res_flux.output
-    flux_gathered_data = perf_res_flux.gathered_output
+    flux_output = perf_res_flux.output if perf_res_flux is not None else None
+    flux_gathered_data = perf_res_flux.gathered_output if perf_res_flux is not None else None
 
     if args.triton:
         triton_output = perf_res_triton.output
