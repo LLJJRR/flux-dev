@@ -103,8 +103,6 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
   check_nccl_signal_ag_support() const {
     FLUX_CHECK_EQ(tp_env.ep_size, 1)
         << "FLUX_MOE_AG_NCCL_SIGNAL currently supports EP1 only";
-    FLUX_CHECK_EQ(tp_env.nnodes, 1)
-        << "FLUX_MOE_AG_NCCL_SIGNAL currently supports single-node execution only";
 
     auto const *algo = std::getenv("NCCL_ALGO");
     auto const *proto = std::getenv("NCCL_PROTO");
@@ -278,6 +276,9 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
         inputs_shard.nbytes(),
         this->cp_stream_intra_node,
         true);
+    // The NCCL path has no NVSHMEM fetch event. Publish the same completion
+    // event consumed by the GEMM path after the NCCL collective is enqueued.
+    CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
     CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
   }
 
@@ -483,7 +484,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     args.barrier_ptr = barrier_block.get();
     args.sm_margin = sm_margin;
 
-    if (tp_env.nnodes > 1) {
+    if (tp_env.nnodes > 1 && !use_nccl_signal_ag()) {
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->fetch_remote_event));
     }
     // A/B baseline: keep helper work overlapped, but serialize GEMM behind the
@@ -499,7 +500,9 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     // ensure that when the next time each rank copy data to itself's shard in the
     // input_buffer, all ranks have already finished allgather so that we can
     // safely modify input_buffer
-    nvshmemx_barrier_all_on_stream(stream);
+    if (!use_nccl_signal_ag()) {
+      nvshmemx_barrier_all_on_stream(stream);
+    }
     if (allgather_output.has_value()) {
       CHECK_INPUT(allgather_output.value(), moe_args.input_dtype);
       CHECK_2D(allgather_output.value(), ntokens, moe_args.hidden);
