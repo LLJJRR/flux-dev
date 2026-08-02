@@ -203,12 +203,17 @@ NcclSignalReduceScatter::start_overlap(
   FLUX_CHECK_GT(split, 0);
   FLUX_CHECK_EQ(count_per_rank % split, 0);
   FLUX_CHECK(!overlap_active_) << "previous NCCL ReduceScatter overlap is still active";
+  const bool unsafe_allow = std::getenv("FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED") != nullptr;
   const char *algo = std::getenv("NCCL_ALGO");
-  FLUX_CHECK(algo != nullptr && std::strcmp(algo, "Ring") == 0)
-      << "experimental NCCL ReduceScatter overlap requires NCCL_ALGO=Ring";
   const char *proto = std::getenv("NCCL_PROTO");
-  FLUX_CHECK(proto != nullptr && std::strcmp(proto, "Simple") == 0)
-      << "experimental NCCL ReduceScatter overlap requires NCCL_PROTO=Simple";
+  if (!unsafe_allow) {
+    FLUX_CHECK(algo != nullptr && std::strcmp(algo, "Ring") == 0)
+        << "experimental NCCL ReduceScatter overlap requires NCCL_ALGO=Ring (or set "
+           "FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED=1 for experiments)";
+    FLUX_CHECK(proto != nullptr && std::strcmp(proto, "Simple") == 0)
+        << "experimental NCCL ReduceScatter overlap requires NCCL_PROTO=Simple (or set "
+           "FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED=1 for experiments)";
+  }
   FLUX_CHECK_LT(producer_epoch_, std::numeric_limits<int>::max());
   ++producer_epoch_;
   nccl_signal_debug(group_->get_rank(), "start_overlap enqueue begin");

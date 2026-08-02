@@ -104,12 +104,17 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     FLUX_CHECK_EQ(tp_env.ep_size, 1)
         << "FLUX_MOE_AG_NCCL_SIGNAL currently supports EP1 only";
 
+    const bool unsafe_allow = std::getenv("FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED") != nullptr;
     auto const *algo = std::getenv("NCCL_ALGO");
     auto const *proto = std::getenv("NCCL_PROTO");
-    FLUX_CHECK(algo != nullptr && std::string(algo) == "Ring")
-        << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_ALGO=Ring";
-    FLUX_CHECK(proto != nullptr && std::string(proto) == "Simple")
-        << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_PROTO=Simple";
+    if (!unsafe_allow) {
+      FLUX_CHECK(algo != nullptr && std::string(algo) == "Ring")
+          << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_ALGO=Ring (or set "
+             "FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED=1 for experiments)";
+      FLUX_CHECK(proto != nullptr && std::string(proto) == "Simple")
+          << "FLUX_MOE_AG_NCCL_SIGNAL requires NCCL_PROTO=Simple (or set "
+             "FLUX_NCCL_SIGNAL_UNSAFE_ALLOW_UNSUPPORTED=1 for experiments)";
+    }
   }
 
   void
