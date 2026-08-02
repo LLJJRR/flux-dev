@@ -779,12 +779,11 @@ THRESHOLD_MAP = {
 }
 
 if __name__ == "__main__":
-    TP_GROUP = initialize_distributed()
-    RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
-
     args = parse_args()
     if args.nccl_signal_only:
         args.compare_nccl_signal = True
+    TP_GROUP = initialize_distributed(init_flux_shm=not args.nccl_signal_only)
+    RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
 
     input_dtype = DTYPE_MAP[args.dtype]
     is_fp8 = is_fp8_dtype(input_dtype)

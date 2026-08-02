@@ -272,6 +272,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
   void
   all_gather_nccl_signal(torch::Tensor const &inputs_shard) {
     check_nccl_signal_ag_support();
+    FLUX_CHECK_EQ(inputs_shard.size(1), moe_args.hidden);
     FLUX_CHECK_LE(inputs_shard.nbytes() * tp_env.world_size, input_buffer.nbytes())
         << "NCCL signal MoE AllGather input exceeds the rank-major input buffer";
 

@@ -518,6 +518,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     bool use_nccl_signal =
         ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
     if (use_nccl_signal) {
+      FLUX_CHECK_LE(M, nccl_input_buffer.size(0))
+          << "NCCL AG input exceeds dedicated buffer capacity";
       input_buffer = nccl_input_buffer.slice(0, 0, M);
       barrier = nccl_barrier;
     }

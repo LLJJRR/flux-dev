@@ -417,6 +417,12 @@ def parse_args():
         help="compare full NCCL wait against source-rank signal overlap with one tuned config",
     )
     parser.add_argument(
+        "--nccl-only",
+        default=False,
+        action="store_true",
+        help="skip native Flux/NVSHMEM and run PyTorch vs NCCL Signal only",
+    )
+    parser.add_argument(
         "--gather_input",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -458,6 +464,11 @@ OUT_DTYPE_MAP = {
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.nccl_only:
+        args.compare_nccl_wait = False
+        assert args.E == 1, "--nccl-only requires EP1"
+        os.environ["FLUX_MOE_AG_NCCL_SIGNAL"] = "1"
+        os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
     if args.compare_nccl_wait:
         assert not args.triton_only, "--compare-nccl-wait is incompatible with --triton-only"
         assert args.E == 1, "--compare-nccl-wait currently requires EP1"
@@ -466,10 +477,11 @@ if __name__ == "__main__":
         os.environ.pop("FLUX_MOE_AG_NCCL_WAIT", None)
     init_ep_group(args.E)
 
-    print("before flux_shm initialization")
-    flux.init_flux_shm(TP_GROUP)
-    torch.cuda.synchronize()
-    print("after flux_shm initialization")
+    if not args.nccl_only:
+        print("before flux_shm initialization")
+        flux.init_flux_shm(TP_GROUP)
+        torch.cuda.synchronize()
+        print("after flux_shm initialization")
 
     input_dtype = DTYPE_MAP[args.dtype]
     is_fp8 = flux.util.is_fp8_dtype(input_dtype)
@@ -533,7 +545,7 @@ if __name__ == "__main__":
         do_prof=args.profile,
         group=TP_GROUP,
     ):
-        if not args.triton_only:
+        if not args.triton_only and not args.nccl_only:
             if args.compare_nccl_wait:
                 shared_flux_op = create_flux_op(moe_ctx)
 
@@ -591,11 +603,15 @@ if __name__ == "__main__":
                 perf_result_flux_native = averaged_result("flux")
                 perf_result_flux_wait = averaged_result("wait")
                 perf_result_flux = averaged_result("signal")
-            else:
+            elif not args.nccl_only:
                 perf_result_flux = perf_flux(
                     moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option
                 )
         perf_result_torch = perf_torch(moe_ctx, args.warmup_iters, args.iters, args.gather_input)
+        if args.nccl_only:
+            perf_result_flux = perf_flux(
+                moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option
+            )
         if args.triton:
             perf_result_triton = perf_triton(
                 moe_ctx, args.warmup_iters, args.iters, args.gather_input, ag_option=ag_option
