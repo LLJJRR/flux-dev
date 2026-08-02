@@ -279,7 +279,6 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     // The NCCL path has no NVSHMEM fetch event. Publish the same completion
     // event consumed by the GEMM path after the NCCL collective is enqueued.
     CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
-    CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
   }
 
   std::vector<torch::Tensor>
