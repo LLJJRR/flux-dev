@@ -248,6 +248,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
   GemmWithBarirer gemm_op;
   AllGatherOp ag_op;
   std::unique_ptr<NcclSignalAllGather> nccl_signal_ag;
+  // Dedicated ordinary CUDA storage for the NCCL path. The native Flux path
+  // continues to use AllGatherOp's NVSHMEM-backed symmetric storage.
+  torch::Tensor nccl_input_buffer;
+  torch::Tensor nccl_barrier;
 
   bool use_pdl;  // sm90 feature
   bool disable_nccl_signal_for_profiling = false;
@@ -281,6 +285,12 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         nnodes(nnodes),
         gemm_op(tp_group->get_rank(), tp_group->get_size(), nnodes),
         ag_op(tp_group, nnodes, full_m, k_dim, input_dtype),
+        nccl_input_buffer(torch::empty(
+            {full_m, k_dim},
+            torch::TensorOptions().device(torch::kCUDA).dtype(input_dtype))),
+        nccl_barrier(torch::zeros(
+            {tp_group->get_size()},
+            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt))),
         use_pdl(use_pdl) {
     // copy stream
     CUDA_CHECK(cudaStreamCreateWithPriority(
@@ -508,6 +518,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     bool use_nccl_signal =
         ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
     if (use_nccl_signal) {
+      input_buffer = nccl_input_buffer.slice(0, 0, M);
+      barrier = nccl_barrier;
+    }
+    if (use_nccl_signal) {
       ag_nccl_debug(
           rank,
           ag_nccl_signal_wait_enabled() ? "forward use NCCL wait path"
@@ -605,7 +619,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         fast_accum,
         transpose_weight,
         hparams,
-        opt.use_cuda_core_ag ? this->ag_op.ag_signal_ptr() : nullptr,
+        opt.use_cuda_core_ag && !use_nccl_signal ? this->ag_op.ag_signal_ptr() : nullptr,
         stream);
     if (use_nccl_signal) {
       ag_nccl_debug(rank, "gemm_op.forward end");
