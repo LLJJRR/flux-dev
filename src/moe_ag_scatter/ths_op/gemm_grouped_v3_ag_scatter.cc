@@ -114,8 +114,17 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
 
   void
   init_buffers() {
-    this->input_buffer =
-        nvshmem_create_tensor({moe_args.max_ntokens, moe_args.hidden}, moe_args.input_dtype);
+    // NCCL owns transport and registration for its path; keep it independent
+    // from NVSHMEM symmetric allocation. The legacy path still requires the
+    // symmetric buffer for its peer get/barrier implementation.
+    if (use_nccl_signal_ag()) {
+      this->input_buffer = torch::empty(
+          {moe_args.max_ntokens, moe_args.hidden},
+          torch::TensorOptions().device(torch::kCUDA).dtype(moe_args.input_dtype));
+    } else {
+      this->input_buffer =
+          nvshmem_create_tensor({moe_args.max_ntokens, moe_args.hidden}, moe_args.input_dtype);
+    }
     auto options = torch::TensorOptions().device(torch::Device(torch::kCUDA));
     this->total_nrows_ep_buffer = torch::empty({1}, options.dtype(c10::ScalarType::Int));
     this->sorted_splits =
