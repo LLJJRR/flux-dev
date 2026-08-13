@@ -56,6 +56,9 @@ class NcclSignalReduceScatter {
       cudaStream_t compute_stream);
   void mark_ready(int rank_segment, int split_idx, cudaStream_t compute_stream);
   void finish_overlap(cudaStream_t compute_stream);
+  torch::Tensor producer_ready() const;
+  torch::Tensor tile_counters() const;
+  int producer_epoch() const;
 
  private:
   std::shared_ptr<Group> group_;

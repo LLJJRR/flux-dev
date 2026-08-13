@@ -37,6 +37,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -161,7 +162,11 @@ class GemmOnly::GemmOnlyImpl {
       c10::optional<torch::Tensor> weight_scale,
       c10::optional<torch::Tensor> output_scale,
       bool fast_accum,
-      c10::optional<UnifiedGemmHParams> const &hparams) {
+      c10::optional<UnifiedGemmHParams> const &hparams,
+      int *rs_producer_ready = nullptr,
+      int *rs_tile_counters = nullptr,
+      int rs_producer_epoch = 0,
+      int rs_world_size = 0) {
     auto rt_conf = get_rt_conf(input, weight, bias, output_buf, input_scale, weight_scale);
     int m = rt_conf.m();
     int n = rt_conf.n();
@@ -179,6 +184,17 @@ class GemmOnly::GemmOnlyImpl {
         hparams.has_value() ? hparams.value()
                             : OpRegistry::instance().get_hparams(meta, rt_conf);
     OpRegistry::OpPtr gemm_op = OpRegistry::instance().get_op(meta, selected_hparams);
+
+    if (rs_producer_ready != nullptr) {
+      FLUX_CHECK_EQ((int)get_arch(), (int)_Sm90{}()) << "RS producer signaling requires SM90";
+      FLUX_CHECK(selected_hparams.gemm_kind() == _GemmDefault{})
+          << "RS producer signaling does not support Stream-K";
+      auto [tile_m, tile_n, tile_k] = selected_hparams.tile_shape();
+      FLUX_CHECK_GT(rs_world_size, 0);
+      FLUX_CHECK_EQ(m % (rs_world_size * tile_m), 0)
+          << "M must be divisible by world_size * GEMM tile_M";
+      FLUX_CHECK_EQ(n % tile_n, 0) << "N must be divisible by GEMM tile_N";
+    }
 
     if (!hparams.has_value() && !logged_hparams && log_hparams_enabled) {
       bool config_hit = TuningConfigRegistry::instance().get(meta, rt_conf) != nullptr;
@@ -254,7 +270,11 @@ class GemmOnly::GemmOnlyImpl {
           .input = input.data_ptr(),
           .weight = weight.data_ptr(),
           .bias = bias.has_value() ? bias->data_ptr() : nullptr,
-          .output = output.data_ptr()};
+          .output = output.data_ptr(),
+          .rs_producer_ready = rs_producer_ready,
+          .rs_tile_counters = rs_tile_counters,
+          .rs_producer_epoch = rs_producer_epoch,
+          .rs_world_size = rs_world_size};
 
       int64_t workspace_size = gemm_op->get_workspace_size(args);
       this->lazy_init_gemm_buffer(input, workspace_size);
@@ -276,6 +296,22 @@ class GemmOnly::GemmOnlyImpl {
   }
 
  public:
+  torch::Tensor
+  forward_with_rs_signal(
+      torch::Tensor input,
+      torch::Tensor weight,
+      c10::optional<torch::Tensor> bias,
+      torch::Tensor output,
+      int *producer_ready,
+      int *tile_counters,
+      int producer_epoch,
+      int world_size) {
+    return forward_impl(
+        std::move(input), std::move(weight), std::move(bias), std::move(output),
+        c10::nullopt, c10::nullopt, c10::nullopt, false, c10::nullopt,
+        producer_ready, tile_counters, producer_epoch, world_size);
+  }
+
   GemmOnlyImpl(
       c10::ScalarType input_dtype,
       c10::ScalarType weight_dtype,
@@ -410,6 +446,38 @@ GemmOnly::forward(
       std::move(weight_scale),
       std::move(output_scale),
       fast_accum);
+}
+
+torch::Tensor
+GemmOnly::forward_with_rs_signal(
+    torch::Tensor input,
+    torch::Tensor weight,
+    c10::optional<torch::Tensor> bias,
+    torch::Tensor output_buf,
+    torch::Tensor producer_ready,
+    torch::Tensor tile_counters,
+    int64_t producer_epoch,
+    int64_t world_size) {
+  FLUX_CHECK(impl_ != nullptr) << "GemmOnly is not initialized";
+  FLUX_CHECK(
+      input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16)
+      << "RS producer signaling currently supports FP16 and BF16";
+  CHECK_INPUT(producer_ready, torch::kInt32);
+  CHECK_INPUT(tile_counters, torch::kInt32);
+  FLUX_CHECK(output_buf.is_cuda());
+  FLUX_CHECK(output_buf.is_contiguous());
+  FLUX_CHECK_EQ(producer_ready.get_device(), input.get_device());
+  FLUX_CHECK_EQ(tile_counters.get_device(), input.get_device());
+  FLUX_CHECK_GT(producer_epoch, 0);
+  FLUX_CHECK_GT(world_size, 0);
+  FLUX_CHECK_LE(producer_epoch, std::numeric_limits<int>::max());
+  FLUX_CHECK_LE(world_size, std::numeric_limits<int>::max());
+  FLUX_CHECK_GE(producer_ready.numel(), world_size);
+  FLUX_CHECK_GE(tile_counters.numel(), world_size);
+  return impl_->forward_with_rs_signal(
+      std::move(input), std::move(weight), std::move(bias), std::move(output_buf),
+      producer_ready.data_ptr<int>(), tile_counters.data_ptr<int>(),
+      static_cast<int>(producer_epoch), static_cast<int>(world_size));
 }
 torch::Tensor
 GemmOnly::profiling(

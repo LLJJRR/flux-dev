@@ -31,6 +31,7 @@
 #include "flux/cuda/cuda_common.h"
 #include "flux/cuda/gemm_impls/gemm_v3_impl.hpp"
 #include "flux/args/comm_none.h"
+#include "comm_none/sm90_epilogue_nccl_rs_signal.hpp"
 
 namespace bytedance {
 namespace flux {
@@ -42,6 +43,7 @@ struct GemmV3CommNone_Kernel : public GemmV3BaseKernel<GemmMetaT, GemmHParamsT> 
   static constexpr auto hparams = to_gemm_hparams(GemmHParamsT{});
   static constexpr auto dt_conf = to_gemm_dtype_config(make_gemm_dtype_config(meta.dtype()));
   static constexpr bool is_fp8_gemm = is_fp8_dtype(dt_conf.a()) && is_fp8_dtype(dt_conf.b());
+  static constexpr bool is_s8_gemm = is_s8_dtype(dt_conf.a()) && is_s8_dtype(dt_conf.b());
   static_assert(meta.comm_op() == _CommNone{}, "requires _CommNone{}");
 
   auto
@@ -56,9 +58,60 @@ struct GemmV3CommNone_Kernel : public GemmV3BaseKernel<GemmMetaT, GemmHParamsT> 
   }
 
   auto
+  nccl_rs_collective_epilogue() const {
+    auto params = cutlass_v3_builder::default_epilogue_params(meta, hparams);
+    constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+    using namespace cutlass::epilogue::fusion;
+    using ElementC = decltype(params.element_c());
+    using ElementCNonVoid = decltype(params.element_c_unvoid());
+    using ElementD = decltype(params.element_d());
+    using ElementAccumulator = decltype(params.element_accumulator());
+    using ElementCompute = ElementAccumulator;
+    using EVT0 = Sm90EVT<
+        Sm90Compute<cutlass::multiplies, ElementD, ElementCompute, RoundStyle>,
+        Sm90ScalarBroadcast<ElementAccumulator>, Sm90AccFetch>;
+    auto select_d = []() {
+      if constexpr (cute::is_void_v<ElementC>) {
+        return make_declval<EVT0>();
+      } else {
+        using EVTD = Sm90EVT<
+            Sm90Compute<cutlass::multiply_add, ElementD, ElementCompute, RoundStyle>,
+            Sm90ScalarBroadcast<ElementAccumulator>, Sm90SrcFetch<ElementCNonVoid>, EVT0>;
+        return make_declval<EVTD>();
+      }
+    };
+    using EVTD = decltype(select_d());
+    using DispatchPolicy = decltype(params.dispatch_policy());
+    using Signal = Sm90NcclRsProducerSignal<
+        DispatchPolicy::StagesD,
+        decltype(params.tile_shape()),
+        decltype(params.epilogue_tile_mn()),
+        ElementD,
+        RoundStyle,
+        decltype(params.stride_d()),
+        decltype(params.smem_layout_atom_d()),
+        decltype(params.copy_op_r2s())>;
+    using CustomEVT = Sm90EVT<Signal, EVTD>;
+    using Callbacks = typename cutlass::epilogue::collective::detail::CallbacksBuilder<
+        DispatchPolicy, CustomEVT, decltype(params.tile_shape()),
+        decltype(params.epilogue_tile_mn()), ElementAccumulator>::Callbacks;
+    return cutlass_v3_builder::build_collective_epilogue(
+        params.fusion_callbacks(TypeWrapper<Callbacks>{}));
+  }
+
+  auto
+  collective_epilogue() const {
+    if constexpr (meta.arch() == _Sm90{} && !is_fp8_gemm && !is_s8_gemm) {
+      return this->nccl_rs_collective_epilogue();
+    } else {
+      return this->default_collective_epilogue();
+    }
+  }
+
+  auto
   gemm_kernel() const {
     using CollectiveMma = decltype(this->default_collective_mma());
-    using CollectiveEpilogue = decltype(this->default_collective_epilogue());
+    using CollectiveEpilogue = decltype(this->collective_epilogue());
     using TileScheduler = decltype(this->tile_scheduler());
 
     constexpr bool use_block_scale = meta.impl_spec().block_scale();
@@ -292,7 +345,21 @@ class GemmV3CommNone_Device : public GemmV3BaseDevice<
 
     using Epilogue = typename GemmKernel::CollectiveEpilogue;
     typename Epilogue::Arguments epilogue{{}, ptr_C, stride_C, ptr_D, stride_D};
-    epilogue.thread = decltype(epilogue.thread){.alpha = args.alpha, .beta = args.beta};
+    if constexpr (meta.arch() == _Sm90{}) {
+      if constexpr (cute::is_void_v<ElementC>) {
+        epilogue.thread = {
+            {{args.alpha}, {}, {}},
+            {args.rs_producer_ready, args.rs_tile_counters,
+             args.rs_producer_epoch, args.rs_world_size}};
+      } else {
+        epilogue.thread = {
+            {{args.beta}, {ptr_C}, {{args.alpha}, {}, {}}, {}},
+            {args.rs_producer_ready, args.rs_tile_counters,
+             args.rs_producer_epoch, args.rs_world_size}};
+      }
+    } else {
+      epilogue.thread = decltype(epilogue.thread){.alpha = args.alpha, .beta = args.beta};
+    }
 
     using TileScheduler = typename GemmKernel::TileScheduler;
     auto scheduler = typename TileScheduler::Arguments{};

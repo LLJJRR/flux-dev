@@ -79,14 +79,24 @@ make_byte_storage(size_t nbytes) {
           .dtype(torch::kByte));
 }
 
+torch::Tensor
+make_int_storage(size_t nelems) {
+  return torch::empty(
+      {static_cast<int64_t>(nelems)},
+      torch::TensorOptions()
+          .device(torch::kCUDA)
+          .device_index(at::cuda::current_device())
+          .dtype(torch::kInt32));
+}
+
 }  // namespace
 
 NcclSignalReduceScatter::NcclSignalReduceScatter(std::shared_ptr<Group> group)
     : group_(std::move(group)),
       nccl_comm_(create_nccl_comm_with_group(group_.get())),
       signal_storage_(make_byte_storage(sizeof(FluxNcclSignalLayout))),
-      counter_storage_(make_byte_storage(sizeof(int) * group_->get_size())),
-      producer_ready_storage_(make_byte_storage(sizeof(int) * group_->get_size())) {
+      counter_storage_(make_int_storage(group_->get_size())),
+      producer_ready_storage_(make_int_storage(group_->get_size())) {
   CUDA_CHECK(cudaStreamCreateWithFlags(&comm_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaEventCreateWithFlags(&completion_event_, cudaEventDisableTiming));
   CUDA_CHECK(cudaMemsetAsync(
@@ -196,7 +206,6 @@ NcclSignalReduceScatter::start_overlap(
     ncclDataType_t datatype,
     int split,
     cudaStream_t compute_stream) {
-  (void)compute_stream;
   FLUX_CHECK(input != nullptr);
   FLUX_CHECK(output != nullptr);
   FLUX_CHECK_GT(count_per_rank, 0);
@@ -218,9 +227,11 @@ NcclSignalReduceScatter::start_overlap(
   ++producer_epoch_;
   nccl_signal_debug(group_->get_rank(), "start_overlap enqueue begin");
   active_split_ = split;
+  CUDA_CHECK(cudaMemsetAsync(
+      counter_storage_.data_ptr(), 0, counter_storage_.nbytes(), compute_stream));
   size_t ready_bytes = sizeof(int) * group_->get_size() * split;
   if (producer_ready_storage_.nbytes() < ready_bytes) {
-    producer_ready_storage_ = make_byte_storage(ready_bytes);
+    producer_ready_storage_ = make_int_storage(group_->get_size() * split);
     CUDA_CHECK(cudaMemsetAsync(
         producer_ready_storage_.data_ptr(), 0, producer_ready_storage_.nbytes(), comm_stream_));
   }
@@ -291,6 +302,27 @@ NcclSignalReduceScatter::finish_overlap(cudaStream_t compute_stream) {
   CUDA_CHECK(cudaStreamWaitEvent(compute_stream, completion_event_, 0));
   overlap_active_ = false;
   nccl_signal_debug(group_->get_rank(), "finish_overlap wait enqueued");
+}
+
+torch::Tensor
+NcclSignalReduceScatter::producer_ready() const {
+  FLUX_CHECK(overlap_active_) << "NCCL ReduceScatter overlap has not been started";
+  FLUX_CHECK_EQ(active_split_, 1) << "GEMM epilogue producer signaling currently requires split=1";
+  return producer_ready_storage_;
+}
+
+torch::Tensor
+NcclSignalReduceScatter::tile_counters() const {
+  FLUX_CHECK(overlap_active_) << "NCCL ReduceScatter overlap has not been started";
+  FLUX_CHECK_EQ(active_split_, 1) << "GEMM epilogue producer signaling currently requires split=1";
+  return counter_storage_;
+}
+
+int
+NcclSignalReduceScatter::producer_epoch() const {
+  FLUX_CHECK(overlap_active_) << "NCCL ReduceScatter overlap has not been started";
+  FLUX_CHECK_EQ(active_split_, 1) << "GEMM epilogue producer signaling currently requires split=1";
+  return producer_epoch_;
 }
 
 }  // namespace bytedance::flux::ths_op

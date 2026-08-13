@@ -30,6 +30,11 @@ struct GemmOnlyArguments {
   void const *weight;
   void const *bias;
   void *output;
+  // Optional SM90 epilogue notification used by signal-driven NCCL RS.
+  int *rs_producer_ready = nullptr;
+  int *rs_tile_counters = nullptr;
+  int rs_producer_epoch = 0;
+  int rs_world_size = 0;
 };
 
 // GEMM with dequantization

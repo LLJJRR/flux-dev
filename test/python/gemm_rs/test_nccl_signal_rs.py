@@ -314,48 +314,33 @@ def perf_flux_nccl_overlap_rs(
     output = torch.empty((m_per_rank, weight.size(0)), dtype=input.dtype, device=input.device)
     gemm_only = flux.GemmOnly(input.dtype, input.dtype, input.dtype, False, False)
     nccl_rs = flux_mod.NcclSignalReduceScatter(group)
-    # Match NCCL Ring+Simple ReduceScatter's receive order: the local rank's
-    # predecessor first, then walk backwards around the ring.
-    segment_order = tuple((rank - 1 - i) % world_size for i in range(world_size))
 
-    def run_split_gemm() -> None:
-        for segment in segment_order:
-            begin = segment * m_per_rank
-            segment_input = input.narrow(0, begin, m_per_rank)
-            segment_bias = None if bias is None else bias.narrow(0, begin, m_per_rank)
-            segment_output = full_output.narrow(0, begin, m_per_rank)
-            gemm_only.forward(
-                segment_input,
-                weight,
-                bias=segment_bias,
-                output_buf=segment_output,
-            )
+    def run_full_gemm() -> None:
+        gemm_only.forward(input, weight, bias=bias, output_buf=full_output)
 
     def run_overlap() -> None:
         nccl_rs.start_overlap(full_output, output)
-        for segment in segment_order:
-            begin = segment * m_per_rank
-            segment_input = input.narrow(0, begin, m_per_rank)
-            segment_bias = None if bias is None else bias.narrow(0, begin, m_per_rank)
-            segment_output = full_output.narrow(0, begin, m_per_rank)
-            gemm_only.forward(
-                segment_input,
-                weight,
-                bias=segment_bias,
-                output_buf=segment_output,
-            )
-            nccl_rs.mark_ready(segment)
+        gemm_only.forward_with_rs_signal(
+            input,
+            weight,
+            bias,
+            full_output,
+            nccl_rs.producer_ready(),
+            nccl_rs.tile_counters(),
+            nccl_rs.producer_epoch(),
+            world_size,
+        )
         nccl_rs.finish_overlap()
 
     benchmark_barrier()
     for _ in range(warmup):
-        run_split_gemm()
+        run_full_gemm()
     benchmark_barrier()
     gemm_start = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     gemm_end = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
         gemm_start[i].record()
-        run_split_gemm()
+        run_full_gemm()
         gemm_end[i].record()
     torch.cuda.synchronize()
     gemm_ms = sum(gemm_start[i].elapsed_time(gemm_end[i]) for i in range(iters)) / iters

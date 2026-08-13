@@ -62,6 +62,17 @@ static int _register_gemm_only_ops [[maybe_unused]] = []() {
             py::arg("output_scale") = py::none(),
             py::arg("fast_accum") = false)
         .def(
+            "forward_with_rs_signal",
+            &GemmOnlyCls::forward_with_rs_signal,
+            py::arg("input"),
+            py::arg("weight"),
+            py::arg("bias"),
+            py::arg("output_buf"),
+            py::arg("producer_ready"),
+            py::arg("tile_counters"),
+            py::arg("producer_epoch"),
+            py::arg("world_size"))
+        .def(
             "profiling",
             &GemmOnlyCls::profiling,
             py::arg("input"),

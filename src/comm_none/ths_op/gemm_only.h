@@ -40,6 +40,15 @@ class GemmOnly {
       c10::optional<torch::Tensor> weight_scale,
       c10::optional<torch::Tensor> output_scale,
       bool fast_accum);
+  torch::Tensor forward_with_rs_signal(
+      torch::Tensor input,
+      torch::Tensor weight,
+      c10::optional<torch::Tensor> bias,
+      torch::Tensor output_buf,
+      torch::Tensor producer_ready,
+      torch::Tensor tile_counters,
+      int64_t producer_epoch,
+      int64_t world_size);
   torch::Tensor profiling(
       torch::Tensor input,
       torch::Tensor weight,

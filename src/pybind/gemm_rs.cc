@@ -199,7 +199,10 @@ static int _register_gemm_rs_ops [[maybe_unused]] = []() {
             "finish_overlap",
             [](NcclSignalReduceScatter &self) {
               self.finish_overlap(at::cuda::getCurrentCUDAStream().stream());
-            });
+            })
+        .def("producer_ready", &NcclSignalReduceScatter::producer_ready)
+        .def("tile_counters", &NcclSignalReduceScatter::tile_counters)
+        .def("producer_epoch", &NcclSignalReduceScatter::producer_epoch);
 
     m.def(
         "test_nccl_signal_reduce_scatter",
