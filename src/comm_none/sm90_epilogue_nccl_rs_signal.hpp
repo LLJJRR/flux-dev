@@ -109,7 +109,8 @@ struct Sm90NcclRsProducerSignal {
       int tiles_m_per_segment = m_tiles / params->world_size;
       int segment = tile_m / tiles_m_per_segment;
       int tiles_per_segment = tiles_m_per_segment * n_tiles;
-      bytedance::flux::atomic_ref_sys<int> counter(params->tile_counters[segment]);
+      cuda::atomic_ref<int, cuda::thread_scope_system> counter(
+          params->tile_counters[segment]);
       int completed = counter.fetch_add(1, cuda::memory_order_acq_rel) + 1;
       if (completed == tiles_per_segment) {
         bytedance::flux::atomic_store_release_sys(
