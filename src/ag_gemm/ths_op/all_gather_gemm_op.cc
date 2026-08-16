@@ -266,7 +266,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         .use_cuda_core_ag = opt.use_cuda_core_ag.value_or(with_input_scale),
         .fuse_sync = opt.fuse_sync.value_or(with_input_scale),
         .use_read = opt.use_read.value_or(false),
-        .mode = opt.mode.value_or(get_default_ag_ring_mode()),
+        // NCCL owns the communication topology in signal mode, so the Flux
+        // ring mode is unused and must not require init_flux_shm().
+        .mode = opt.mode.value_or(
+            ag_nccl_signal_enabled() ? AGRingMode::Ring1D : get_default_ag_ring_mode()),
     };
   }
 
