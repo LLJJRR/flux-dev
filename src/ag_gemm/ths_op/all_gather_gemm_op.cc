@@ -246,7 +246,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
   cudaEvent_t all_gather_event;
 
   GemmWithBarirer gemm_op;
-  AllGatherOp ag_op;
+  std::unique_ptr<AllGatherOp> ag_op;
   std::unique_ptr<NcclSignalAllGather> nccl_signal_ag;
   // Dedicated ordinary CUDA storage for the NCCL path. The native Flux path
   // continues to use AllGatherOp's NVSHMEM-backed symmetric storage.
@@ -284,7 +284,10 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         world_size(tp_group->get_size()),
         nnodes(nnodes),
         gemm_op(tp_group->get_rank(), tp_group->get_size(), nnodes),
-        ag_op(tp_group, nnodes, full_m, k_dim, input_dtype),
+        ag_op(ag_nccl_signal_enabled() && tp_group->get_size() > 1
+                  ? std::unique_ptr<AllGatherOp>{}
+                  : std::make_unique<AllGatherOp>(
+                        tp_group, nnodes, full_m, k_dim, input_dtype)),
         nccl_input_buffer(torch::empty(
             {full_m, k_dim},
             torch::TensorOptions().device(torch::kCUDA).dtype(input_dtype))),
@@ -511,17 +514,22 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       agk_event_record(fwd_start, stream);
     }
 
-    torch::Tensor barrier = ag_op.local_barrier_buffer();
     int M = input.size(0) * this->world_size;
-    torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
     bool is_s8_gemm = is_s8_torch_dtype(input.scalar_type());
     bool use_nccl_signal =
         ag_nccl_signal_enabled() && this->world_size > 1 && !this->disable_nccl_signal_for_profiling;
+    torch::Tensor barrier;
+    torch::Tensor input_buffer;
     if (use_nccl_signal) {
       FLUX_CHECK_LE(M, nccl_input_buffer.size(0))
           << "NCCL AG input exceeds dedicated buffer capacity";
       input_buffer = nccl_input_buffer.slice(0, 0, M);
       barrier = nccl_barrier;
+    } else {
+      FLUX_CHECK(this->ag_op != nullptr)
+          << "native Flux AG storage is unavailable while NCCL Signal is disabled";
+      input_buffer = this->ag_op->local_input_buffer().slice(0, 0, M);
+      barrier = this->ag_op->local_barrier_buffer();
     }
     if (use_nccl_signal) {
       ag_nccl_debug(
@@ -534,7 +542,8 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     at::optional<torch::Tensor> input_scale_tensor =
         is_s8_gemm
             ? (input_scale.has_value()
-                   ? at::optional<torch::Tensor>{ag_op.local_input_scale_buffer().slice(0, 0, M)}
+                   ? at::optional<torch::Tensor>{
+                         this->ag_op->local_input_scale_buffer().slice(0, 0, M)}
                    : c10::nullopt)
             : input_scale;
 
@@ -574,7 +583,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream));
       ag_nccl_debug(rank, "all_gather_event recorded");
     } else {
-      ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
+      this->ag_op->run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, this->cp_stream);
     }
 
     if (prof) {
@@ -586,7 +595,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
     }
 
     if (!use_nccl_signal) {
-      CUDA_CHECK(cudaStreamWaitEvent(stream, ag_op.get_local_prepare_event()));
+      CUDA_CHECK(cudaStreamWaitEvent(stream, this->ag_op->get_local_prepare_event()));
     } else if (ag_nccl_signal_wait_enabled()) {
       ag_nccl_debug(rank, "wait all_gather_event begin");
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
@@ -621,7 +630,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         fast_accum,
         transpose_weight,
         hparams,
-        opt.use_cuda_core_ag && !use_nccl_signal ? this->ag_op.ag_signal_ptr() : nullptr,
+        opt.use_cuda_core_ag && !use_nccl_signal ? this->ag_op->ag_signal_ptr() : nullptr,
         stream);
     if (use_nccl_signal) {
       ag_nccl_debug(rank, "gemm_op.forward end");
@@ -714,14 +723,17 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
       c10::optional<torch::Tensor> gathered_input,
       c10::optional<UnifiedGemmHParams> const &hparams,
       cudaStream_t stream) {
-    torch::Tensor barrier = ag_op.local_barrier_buffer();
+    FLUX_CHECK(this->ag_op != nullptr)
+        << "PDL path requires native Flux AG storage";
+    torch::Tensor barrier = this->ag_op->local_barrier_buffer();
     int M = input.size(0) * this->world_size;
-    torch::Tensor input_buffer = ag_op.local_input_buffer().slice(0, 0, M);
+    torch::Tensor input_buffer = this->ag_op->local_input_buffer().slice(0, 0, M);
     bool is_s8_gemm = is_s8_torch_dtype(input.scalar_type());
     at::optional<torch::Tensor> input_scale_tensor =
         is_s8_gemm
             ? (input_scale.has_value()
-                   ? at::optional<torch::Tensor>{ag_op.local_input_scale_buffer().slice(0, 0, M)}
+                   ? at::optional<torch::Tensor>{
+                         this->ag_op->local_input_scale_buffer().slice(0, 0, M)}
                    : c10::nullopt)
             : input_scale;
 
@@ -739,7 +751,7 @@ class AllGatherGemmOp::AllGatherGemmOpImpl {
         hparams,
         stream);
 
-    ag_op.run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, stream);
+    this->ag_op->run(input, is_s8_gemm ? input_scale : c10::nullopt, opt, stream);
 
     this->gemm_op.run(stream, /*launch_with_pdl=*/true);
     if (gathered_input.has_value()) {
