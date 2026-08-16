@@ -353,7 +353,7 @@ class GemmV3CommNone_Device : public GemmV3BaseDevice<
              args.rs_producer_epoch, args.rs_world_size}};
       } else {
         epilogue.thread = {
-            {{args.beta}, {ptr_C}, {{args.alpha}, {}, {}}, {}},
+            {{args.beta}, {}, {{args.alpha}, {}, {}}, {}},
             {args.rs_producer_ready, args.rs_tile_counters,
              args.rs_producer_epoch, args.rs_world_size}};
       }
